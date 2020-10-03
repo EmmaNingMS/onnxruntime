@@ -7,11 +7,12 @@ using namespace ::onnxruntime::common;
 
 namespace onnxruntime {
 
-Status GraphTransformer::Apply(Graph& graph, bool& modified) const {
+Status GraphTransformer::Apply(Graph& graph, bool& modified, const logging::Logger& logger) const {
   // the Graph should be in a good state prior this being called, so there should be no need to call Resolve here
   // ORT_RETURN_IF_ERROR(graph.Resolve());
 
-  auto status = ApplyImpl(graph, modified, 0);
+#if !defined(ORT_MINIMAL_BUILD)
+  auto status = ApplyImpl(graph, modified, 0, logger);
   ORT_RETURN_IF_ERROR(status);
 
   // At least currently, some transformers (InsertCastTransformer and MemcpyTransformer) need this to be called
@@ -19,7 +20,12 @@ Status GraphTransformer::Apply(Graph& graph, bool& modified) const {
   if (modified) {
     status = graph.Resolve();
   }
-
+#else
+  ORT_UNUSED_PARAMETER(graph);
+  ORT_UNUSED_PARAMETER(modified);
+  ORT_UNUSED_PARAMETER(logger);
+  Status status(ONNXRUNTIME, FAIL, "Transformers are not supported in this build");
+#endif
   return status;
 }
 

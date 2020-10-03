@@ -14,7 +14,7 @@ bool NodeArgShapeUnknownOnAxis(const NodeArg* def, int64_t axis) {
   axis = HandleNegativeAxis(axis, shape->dim_size());
   ORT_ENFORCE(axis < shape->dim_size());
   auto dim = shape->dim(axis);
-  return dim.has_dim_param() || (!dim.has_dim_param() && !dim.has_dim_value());
+  return utils::HasDimParam(dim) || (!utils::HasDimParam(dim) && !utils::HasDimValue(dim));
 }
 
 bool HasUnknownShapeOnAxis(const ConstPointerContainer<std::vector<NodeArg*>>& defs, int64_t axis) {
@@ -35,38 +35,39 @@ bool HasUnknownShapeOnAxes(const NodeArg* def, std::vector<int64_t>& axes) {
   return false;
 }
 
-Status GetSliceAxesFromTensorProto(std::vector<int64_t>& axes,
-                                   const ONNX_NAMESPACE::TensorProto& axes_tp) {
+Status GetVectorInt64FromTensorProto(std::vector<int64_t>& v,
+                                     const ONNX_NAMESPACE::TensorProto& tp) {
   size_t tp_sz_in_bytes;
-  ORT_RETURN_IF_ERROR(utils::GetSizeInBytesFromTensorProto<0>(axes_tp, &tp_sz_in_bytes));
+  ORT_RETURN_IF_ERROR(utils::GetSizeInBytesFromTensorProto<0>(tp, &tp_sz_in_bytes));
   OrtValue ort_value;
   std::unique_ptr<char[]> data(new char[tp_sz_in_bytes]);
 
-#define UNPACK_TENSOR(T)                                                \
-   T* p = reinterpret_cast<T*>(data.get());                             \
-   ORT_RETURN_IF_ERROR(utils::UnpackTensor<T>(                          \
-       axes_tp,                                                         \
-       axes_tp.raw_data().size() ? axes_tp.raw_data().data() : nullptr, \
-       axes_tp.raw_data().size(),                                       \
-       p,                                                               \
-       tp_sz_in_bytes / sizeof(T)));                                    \
-   std::vector<T> tmp_axes(p, p + tp_sz_in_bytes / sizeof(T));
+#define UNPACK_TENSOR(T)                                     \
+  T* p = reinterpret_cast<T*>(data.get());                   \
+  ORT_RETURN_IF_ERROR(utils::UnpackTensor<T>(                \
+      tp,                                                    \
+      tp.raw_data().size() ? tp.raw_data().data() : nullptr, \
+      tp.raw_data().size(),                                  \
+      p,                                                     \
+      tp_sz_in_bytes / sizeof(T)));                          \
+  std::vector<T> tmp_v(p, p + tp_sz_in_bytes / sizeof(T));
+  v.clear();
 
-  switch (axes_tp.data_type()) {
+  switch (tp.data_type()) {
     case ONNX_NAMESPACE::TensorProto_DataType_INT32: {
       UNPACK_TENSOR(int32_t);
-      for (auto axis : tmp_axes) {
-        axes.push_back(static_cast<int64_t>(axis));
+      for (auto axis : tmp_v) {
+        v.push_back(static_cast<int64_t>(axis));
       }
       break;
     }
     case ONNX_NAMESPACE::TensorProto_DataType_INT64: {
       UNPACK_TENSOR(int64_t);
-      axes.insert(axes.end(), tmp_axes.begin(), tmp_axes.end());
+      v.insert(v.end(), tmp_v.begin(), tmp_v.end());
       break;
     }
     default:
-      ORT_NOT_IMPLEMENTED("Unimplemented type: ", axes_tp.data_type());
+      ORT_NOT_IMPLEMENTED("Unimplemented type: ", tp.data_type());
   }
 
   return Status::OK();

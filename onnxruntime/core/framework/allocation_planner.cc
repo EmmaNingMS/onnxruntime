@@ -13,6 +13,7 @@
 #include "core/framework/mldata_type_utils.h"
 #include "core/framework/op_kernel.h"
 #include "core/framework/session_state.h"
+#include "core/framework/tensorprotoutils.h"
 #include "core/framework/utils.h"
 
 using namespace onnxruntime::common;
@@ -47,7 +48,7 @@ std::ostream& operator<<(std::ostream& out, AllocKind alloc_kind) {
 std::ostream& operator<<(std::ostream& out, std::pair<const SequentialExecutionPlan*, const SessionState*> planinfo) {
   const SequentialExecutionPlan& plan = *planinfo.first;
   const SessionState& session_state = *planinfo.second;
-  auto& graph = *session_state.GetGraphViewer();
+  auto& graph = session_state.GetGraphViewer();
   std::unordered_map<int, std::string> index_to_name;
 
   out << "Allocation Plan:\n";
@@ -99,20 +100,31 @@ std::ostream& operator<<(std::ostream& out, std::pair<const SequentialExecutionP
   return out;
 }
 
+static const KernelCreateInfo& GetKernelCreateInfo(
+    const std::unordered_map<NodeIndex, gsl::not_null<const KernelCreateInfo*>>& kernel_create_info_map,
+    NodeIndex node_index) {
+  auto entry = kernel_create_info_map.find(node_index);
+  ORT_ENFORCE(entry != kernel_create_info_map.cend(),
+              "SessionState should have saved the KernelCreateInfo prior to this running. NodeIndex:", node_index);
+
+  return *entry->second;
+}
+
 class PlannerImpl {
  public:
   PlannerImpl(const Node* parent_node, const onnxruntime::GraphViewer& graph_viewer,
               const std::vector<const NodeArg*>& outer_scope_node_args, const ExecutionProviders& providers,
-              const KernelRegistryManager& kernel_registry, const OrtValueNameIdxMap& ort_value_name_idx_map,
+              const std::unordered_map<NodeIndex, gsl::not_null<const KernelCreateInfo*>>& kernel_create_info_map,
+              const OrtValueNameIdxMap& ort_value_name_idx_map,
               const ISequentialPlannerContext& context, SequentialExecutionPlan& plan)
-      : context_{context},
-        plan_{plan},
-        parent_node_{parent_node},
-        graph_viewer_{graph_viewer},
-        outer_scope_node_args_{outer_scope_node_args},
-        execution_providers_{providers},
-        kernel_registry_{kernel_registry},
-        ort_value_name_idx_map_{ort_value_name_idx_map} {}
+      : context_(context),
+        plan_(plan),
+        parent_node_(parent_node),
+        graph_viewer_(graph_viewer),
+        outer_scope_node_args_(outer_scope_node_args),
+        execution_providers_(providers),
+        kernel_create_info_map_(kernel_create_info_map),
+        ort_value_name_idx_map_(ort_value_name_idx_map) {}
 
   Status CreatePlan();
 
@@ -125,14 +137,20 @@ class PlannerImpl {
   const std::vector<const NodeArg*>& outer_scope_node_args_;
   const ExecutionProviders& execution_providers_;
 
-  const KernelRegistryManager& kernel_registry_;
+  const std::unordered_map<NodeIndex, gsl::not_null<const KernelCreateInfo*>>& kernel_create_info_map_;
   const OrtValueNameIdxMap& ort_value_name_idx_map_;
 
   // OrtValueInfo: Auxiliary information about an OrtValue used only during plan-generation:
   struct OrtValueInfo {
     const onnxruntime::NodeArg* p_def_site;  // the (unique) NodeArg corresponding to the MLValue
     int usecount = 0;                        // static reference-count
-    OrtValueIndex reused_buffer_index;       // index of original buffer to reuse
+
+    // This is initialized to -1 to ensure that if ProcessDef is somehow not called, planning
+    // will fail more cleanly.  This is also used as a temporary workaround to detect the
+    // case that the DML provider has removed initilizers from the graph during partitioning. 
+    // Removing initializers is a temporary measure needed to limit the number of copies of 
+    // tensors in GPU memory.
+    OrtValueIndex reused_buffer_index = -1;  // index of original buffer to reuse
   };
 
   // ort_value_info_ is indexed by an OrtValueIndex
@@ -164,6 +182,12 @@ class PlannerImpl {
     return ort_value_info_[n].usecount;
   }
   int& UseCount(const OrtValueName& name) { return UseCount(Index(name)); }
+
+  int DecrementUseCount(OrtValueIndex n) {
+    int& use_count = --UseCount(n);
+    assert(use_count >= 0);
+    return use_count;
+  }
 
   OrtValueIndex& Buffer(OrtValueIndex n) {
     ORT_ENFORCE(n >= 0 && static_cast<size_t>(n) < ort_value_info_.size());
@@ -202,16 +226,16 @@ class PlannerImpl {
     symplan.reused_buffer = original;
   }
 
-  // Find if there exists some input tensor that we can use in-place for output_arg
+  // Find if there exists some input tensor that we can use in-place for output_arg_num-th input in the node.
   bool FindReusableInput(const onnxruntime::Node& node, int output_arg_num, OrtValueIndex* reusable_input) {
     auto p_output_arg = node.OutputDefs()[output_arg_num];
-    const KernelCreateInfo* ci;
-    Status st = kernel_registry_.SearchKernelRegistry(node, &ci);
-    if (!st.IsOK() || ci == nullptr || ci->kernel_def == nullptr) {
+    const KernelCreateInfo& ci = GetKernelCreateInfo(kernel_create_info_map_, node.Index());
+
+    if (ci.kernel_def == nullptr) {
       return false;
     }
 
-    const std::vector<std::pair<int, int>>& alias_map = ci->kernel_def->Alias();
+    const std::vector<std::pair<int, int>>& alias_map = ci.kernel_def->Alias();
     auto input_args = node.InputDefs();
     for (auto pair : alias_map) {
       if (pair.second == output_arg_num) {
@@ -226,7 +250,7 @@ class PlannerImpl {
       }
     }
 
-    const std::vector<std::pair<int, int>>& inplace_map = ci->kernel_def->MayInplace();
+    const std::vector<std::pair<int, int>>& inplace_map = ci.kernel_def->MayInplace();
     for (auto pair : inplace_map) {
       if (pair.second == output_arg_num) {
         if ((0 <= pair.first) && (static_cast<size_t>(pair.first) < input_args.size())) {
@@ -250,14 +274,16 @@ class PlannerImpl {
 
   static bool SameShape(const TensorShapeProto& shape1, const TensorShapeProto& shape2) {
     // TODO: This should probably be defined to be the equality operator on TensorShapeProto.
+    namespace on = ONNX_NAMESPACE;
     int rank1 = shape1.dim_size();
     if (shape2.dim_size() != rank1) return false;
     for (int i = 0; i < rank1; i++) {
       const auto& val1 = shape1.dim(i);
       const auto& val2 = shape2.dim(i);
-      if (val1.has_dim_value() && val2.has_dim_value() && (val1.dim_value() == val2.dim_value()))
+      if (utils::HasDimValue(val1) && utils::HasDimValue(val2) &&
+          (val1.dim_value() == val2.dim_value()))
         continue;  // same known dimension
-      if (val1.has_dim_param() && val2.has_dim_param()) {
+      if (utils::HasDimParam(val1) && utils::HasDimParam(val2)) {
         const auto& val1_param = val1.dim_param();
         if (val1_param == val2.dim_param() && !val1_param.empty())
           continue;  // same unknown dimension
@@ -278,9 +304,21 @@ class PlannerImpl {
     return elt_type->Size();
   }
 
-  static bool SameSize(const TensorShapeProto& shape1, const DataType& ptype1, const TensorShapeProto& shape2,
-                       const DataType& ptype2) {
-    return (GetElementSize(ptype1) == GetElementSize(ptype2)) && SameShape(shape1, shape2);
+  static bool SameSize(const TensorShapeProto& shape1, const onnxruntime::NodeArg& arg1,
+                       const TensorShapeProto& shape2, const onnxruntime::NodeArg& arg2) {
+    const auto& ptype1 = arg1.Type();
+    const auto& ptype2 = arg2.Type();
+    auto type1_size = GetElementSize(ptype1);
+    auto type2_size = GetElementSize(ptype2);
+    bool is_type1_string = arg1.TypeAsProto()->tensor_type().elem_type() == ONNX_NAMESPACE::TensorProto_DataType_STRING;
+    bool is_type2_string = arg2.TypeAsProto()->tensor_type().elem_type() == ONNX_NAMESPACE::TensorProto_DataType_STRING;
+
+    // sizeof(std::string) = sizeof(double) on gcc 4.8.x on CentOS. This causes the allocation planner to reuse
+    // a tensor of type double. This won't work for string tensors since they need to be placement new'ed.
+    // If either of the tensors is a string, don't treat them the same. Moreover, reusing a string tensor for a string
+    // tensor without releasing the previous memory can cause memory leaks; hence we don't allow reuse across string
+    // tensors as well.
+    return !(is_type1_string || is_type2_string) && (type1_size == type2_size) && SameShape(shape1, shape2);
 
     /* TODO: we can improve this if the concrete shapes are known for both as below.
        Unclear whether this is worthwhile though.
@@ -302,26 +340,29 @@ class PlannerImpl {
     auto p_shape2 = context_.GetShape(arg2);
     // If the shapes are unknown, we conservatively assume they may be of different size.
     if ((nullptr == p_shape1) || (nullptr == p_shape2)) return false;
-    return SameSize(*p_shape1, arg1.Type(), *p_shape2, arg2.Type());
+    return SameSize(*p_shape1, arg1, *p_shape2, arg2);
   }
 
   // Find if freelist contains a buffer of the same size as output_arg
   bool FindReusableTensor(const onnxruntime::NodeArg& output_arg, OrtValueIndex* reusable_tensor) {
     auto p_required_buffer_shape = context_.GetShape(output_arg);
-    if (nullptr == p_required_buffer_shape) return false;
-    auto required_buffer_type = output_arg.Type();
-    auto& required_allocator_info = AllocPlan(output_arg.Name()).location;
+    if (nullptr == p_required_buffer_shape || p_required_buffer_shape->dim_size() == 0) return false;
+    auto& required_memory_info = AllocPlan(output_arg.Name()).location;
+    if (HasFence(&output_arg)) return false;
 
     for (auto it = freelist_.begin(); it != freelist_.end(); ++it) {
       size_t reusable = static_cast<size_t>(it->ml_value);
       const onnxruntime::NodeArg* p_node_arg = ort_value_info_.at(reusable).p_def_site;
-      auto& available_allocator_info = AllocPlan(p_node_arg->Name()).location;
-      if (!(available_allocator_info == required_allocator_info)) continue;
+      if (!p_node_arg) {
+        // TODO this should be an error case, needs more investigation
+        continue;
+      }
+      auto& available_memory_info = AllocPlan(p_node_arg->Name()).location;
+      if (!(available_memory_info == required_memory_info)) continue;
       auto p_available_buffer_shape = context_.GetShape(*p_node_arg);
       if (nullptr != p_available_buffer_shape) {
-        auto available_buffer_type = p_node_arg->Type();
-        if (SameSize(*p_available_buffer_shape, available_buffer_type,
-                     *p_required_buffer_shape, required_buffer_type)) {
+        if (SameSize(*p_available_buffer_shape, *p_node_arg,
+                     *p_required_buffer_shape, output_arg)) {
           *reusable_tensor = it->ml_value;
           freelist_.erase(it);
           return true;
@@ -374,30 +415,29 @@ class PlannerImpl {
 
     for (SequentialExecutionPlan::NodeExecutionPlan& step : plan_.execution_plan) {
       auto pnode = graph_viewer_.GetNode(step.node_index);
-      if (pnode == nullptr) return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Can not find the node ", step.node_index);
+      if (pnode == nullptr) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Can not find the node ", step.node_index);
+      }
 
       // Identify where each output of this node should be allocated.
-      // This is determined by the opkernel bound to the node.
-      const KernelCreateInfo* kernel_create_info = nullptr;
-      ORT_RETURN_IF_ERROR(kernel_registry_.SearchKernelRegistry(*pnode, &kernel_create_info));
-      auto p_kernelDef = kernel_create_info->kernel_def.get();
-      if (nullptr == p_kernelDef) {
-        std::ostringstream errormsg;
-        errormsg << "No suitable kernel definition found for op " << pnode->OpType();
-        if (pnode->Op() != nullptr) {
-          errormsg << "(" << pnode->Op()->since_version() << ")";
-        }
-        if (!pnode->Name().empty()) errormsg << " (node " << pnode->Name() << ")";
-        return Status(ONNXRUNTIME, FAIL, errormsg.str());
-      }
+      // This is determined by the OpKernel bound to the node.
+      const KernelCreateInfo& kernel_create_info = GetKernelCreateInfo(kernel_create_info_map_, pnode->Index());
+
+      const auto* p_kernel_def = kernel_create_info.kernel_def.get();
+
+      ORT_ENFORCE(p_kernel_def, "Should not have entry in kernel create info with nullptr for kernel_def");
+
       auto exec_provider = execution_providers_.Get(*pnode);
       if (exec_provider == nullptr) {
         return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Can not find the execution provider ",
                                pnode->GetExecutionProviderType());
       }
 
+      bool is_implicit_input = false;
+
       // increment UseCount and add location information if applicable for the provided input def
-      auto process_input = [&graph_inputs, &exec_provider, &p_kernelDef, this](const NodeArg& input, size_t arg_idx) {
+      auto process_input = [&graph_inputs, &exec_provider, &p_kernel_def, &is_implicit_input,
+                            this](const NodeArg& input, size_t arg_idx) {
         const auto& name = input.Name();
         UseCount(name)++;
 
@@ -410,14 +450,22 @@ class PlannerImpl {
                            return value && value->Name() == name;
                          }) != outer_scope_node_args_.cend()) {
           OrtValueIndex index = Index(name);
-          plan_.SetLocation(static_cast<size_t>(index),
-                            exec_provider->GetAllocator(0, p_kernelDef->InputMemoryType(arg_idx))->Info());
+
+          // implicit inputs do not have an entry in the kernel def, so do nothing to them here, leaving the control
+          //   flow op (Loop, Scan, If) to do the necessary copy if the input crosses different provider.
+          // matching logic is used in TransformerMemcpyImpl::ProcessDefs
+          if (!is_implicit_input) {
+            OrtMemType mem_type = p_kernel_def->InputMemoryType(arg_idx);
+            plan_.SetLocation(static_cast<size_t>(index), exec_provider->GetAllocator(0, mem_type)->Info());
+          }
         }
 
         return Status::OK();
       };
 
       ORT_RETURN_IF_ERROR(Node::ForEachWithIndex(pnode->InputDefs(), process_input));
+
+      is_implicit_input = true;
       ORT_RETURN_IF_ERROR(Node::ForEachWithIndex(pnode->ImplicitInputDefs(), process_input));
 
       auto outputs = pnode->OutputDefs();
@@ -428,12 +476,14 @@ class PlannerImpl {
         OrtValueIndex index = Index(node_output->Name());
         ProcessDef(index, node_output);
         ++UseCount(index);
-        plan_.SetLocation(static_cast<size_t>(index), exec_provider->GetAllocator(0, p_kernelDef->OutputMemoryType(i))->Info());
+        plan_.SetLocation(static_cast<size_t>(index),
+                          exec_provider->GetAllocator(0, p_kernel_def->OutputMemoryType(i))->Info());
       }
+
       // if sync is needed, mark allocation plan as create_fence_if_async=true
       // note that the input arg may come from an execution provider (i.e. CPU) that does not support async,
       // in which case create_fence_if_async would be ignored when creating MLValue
-      if (p_kernelDef->ExecQueueId() != 0) {
+      if (p_kernel_def->ExecQueueId() != 0) {
         pnode->ForEachDef([this](const onnxruntime::NodeArg& arg, bool /*is_input*/) {
           OrtValueIndex index = Index(arg.Name());
           AllocPlan(index).create_fence_if_async = true;
@@ -452,13 +502,11 @@ class PlannerImpl {
     auto* p_provider = execution_providers_.Get(node);
     ORT_ENFORCE(p_provider);
 
-    const KernelCreateInfo* kernel_create_info;
-    auto st = kernel_registry_.SearchKernelRegistry(node, &kernel_create_info);
-    ORT_ENFORCE(st.IsOK(), st.ErrorMessage());
-    ORT_ENFORCE(kernel_create_info != nullptr && kernel_create_info->kernel_def != nullptr);
-    if (kernel_create_info->kernel_def->IsInputOnCpu(input_index))
+    const KernelCreateInfo& kernel_create_info = GetKernelCreateInfo(kernel_create_info_map_, node.Index());
+
+    if (kernel_create_info.kernel_def->IsInputOnCpu(input_index))
       // weights are not output from any node, so it's OK to put its location on CPU provider
-      return execution_providers_.GetDefaultCpuAllocatorInfo();
+      return execution_providers_.GetDefaultCpuMemoryInfo();
     return p_provider->GetAllocator(0, OrtMemTypeDefault)->Info();
   }
 
@@ -466,18 +514,24 @@ class PlannerImpl {
     auto& weights = graph_viewer_.GetAllInitializedTensors();
     std::vector<std::vector<OrtMemoryInfo>> locations(plan_.allocation_plan.size());
     for (auto& node : graph_viewer_.Nodes()) {
-      ORT_RETURN_IF_ERROR(onnxruntime::Node::ForEachWithIndex(
+      auto status = onnxruntime::Node::ForEachWithIndex(
           node.InputDefs(), [this, &locations, &node, &weights](const onnxruntime::NodeArg& def, size_t index) {
-            try {
+            auto sub_status = Status::OK();
+            ORT_TRY {
               auto& def_name = def.Name();
               if (!weights.count(def_name)) return Status::OK();
               auto wt_index = Index(def_name);
               locations[wt_index].emplace_back(GetLocationForNodeInput(index, node));
-            } catch (std::exception& ex) {
-              return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, ex.what());
             }
-            return Status::OK();
-          }));
+            ORT_CATCH(const std::exception& ex) {
+              ORT_HANDLE_EXCEPTION([&]() {
+                sub_status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, ex.what());
+              });
+            }
+            return sub_status;
+          });
+
+      ORT_RETURN_IF_ERROR(status);
     }
     for (size_t i = 0; i != locations.size(); ++i) {
       const std::vector<OrtMemoryInfo>& loc = locations[i];
@@ -487,7 +541,7 @@ class PlannerImpl {
       for (size_t j = 0; j != loc.size(); ++j) {
         if (loc[j] != loc[0]) {
           // set the location to CPU
-          plan_.allocation_plan[i].location = execution_providers_.GetDefaultCpuAllocatorInfo();
+          plan_.allocation_plan[i].location = execution_providers_.GetDefaultCpuMemoryInfo();
           break;
         }
       }
@@ -497,7 +551,7 @@ class PlannerImpl {
 
   // Should only be used after ProcessDef()
   Status ComputeReusePlan() {
-    std::vector<SequentialExecutionPlan::NodeExecutionPlan>& execution_plan{plan_.execution_plan};
+    std::vector<SequentialExecutionPlan::NodeExecutionPlan>& execution_plan(plan_.execution_plan);
 
     // Identify allocation/deallocation plan for every ml-value
 
@@ -523,55 +577,87 @@ class PlannerImpl {
     // set AllocationInfo for each weight
     ORT_RETURN_IF_ERROR(GeneratePlanForWeights());
 
+    // Cached graph outputs.
+    const auto& graph_outputs = graph_viewer_.GetOutputs();
     for (size_t program_counter = 0; program_counter < execution_plan.size(); ++program_counter) {
       SequentialExecutionPlan::NodeExecutionPlan step = execution_plan[program_counter];
-      auto pnode = graph_viewer_.GetNode(step.node_index);
-      // graph outputs
-      auto& graph_outputs = graph_viewer_.GetOutputs();
-      // determine allocation for outputs of pnode
-      int output_arg_num = 0;
-      for (auto node_output : pnode->OutputDefs()) {
+      // the node (aka operator) which carries the considered program (aka computation).
+      const auto* pnode = graph_viewer_.GetNode(step.node_index);
+      // node outputs.
+      const auto& output_defs = pnode->OutputDefs();
+      // output_arg_def_index is the index of ArgDefs in pnode's output list.
+      // At the i-th iteration, we build the allocation plan for the i-th
+      // NodeArg in pnode's output list. Allocation plan remains untouched for
+      // optional-missing outputs (aka values with empty names).
+      for (size_t output_arg_def_index = 0, end = output_defs.size(); output_arg_def_index < end; ++output_arg_def_index) {
+        const auto& node_output = output_defs[output_arg_def_index];
         if (!node_output->Exists()) continue;
-        auto current = Index(node_output->Name());
+        // OrtValue index of the considered output NodeArg.
+        const auto current = Index(node_output->Name());
         AllocPlan(current).value_type = utils::GetMLDataType(*node_output);
+        // Declare OrtValue index of the reused buffer.
+        // The the OrtValue indexed by current may reuse the memory in the OrtValue indexed by reused.
         OrtValueIndex reused;
         if (std::find(graph_outputs.begin(), graph_outputs.end(), node_output) != graph_outputs.end()) {
           // node_output is graph's output, so we can't reuse intermediate buffer
           AllocPlan(current).alloc_kind = AllocKind::kAllocateOutput;
 
-          // hacky perf optimization to not copy a pre-existing value to an output if this is a Loop subgraph.
-          // ideally this is temporary, and a future ONNX change to allow empty variadic inputs means we don't
-          // have converted models that unnecessarily add loop state variables. if the value is just being
-          // passed through an implicit input should be used instead.
+          // hacky perf optimization to not copy a pre-existing value to an output if this is a Loop subgraph and
+          // the value is not being changed in the subgraph.
+          //
+          // this usage of a loop state variable has been seen in two scenarios. both have better alternatives now.
+          // we maintain the optimization for existing models.
+          //
+          // 1. a loop state variable was being provided due to ONNX not supporting empty variadic inputs.
+          //    a dummy loop state variable was required in this case.
+          //    ONNX now supports empty variadic inputs, so a new model should not add a dummy loop state variable.
+          //
+          // 2. a loop state variable was being used to explicitly pass in an outer scope value to the subgraph.
+          //    this sort of usage is automatically handled via implicit inputs and there's no need to add a
+          //    loop state variable in order to access the outer scope value.
           if (parent_node_ && pnode->OpType() == "Identity" && parent_node_->OpType() == "Loop") {
-            const auto& input_name = pnode->InputDefs()[0]->Name();
-            const auto input_index = Index(input_name);
-            const auto& alloc_plan = AllocPlan(input_index);
-            if (alloc_plan.alloc_kind == AllocKind::kPreExisting) {
-              Reuse(input_index, current, AllocKind::kShare);
+            const NodeArg* input = pnode->InputDefs()[0];
+
+            // first input to the Loop subgraph is the iteration number.
+            bool input_is_loop_iteration_number = input == graph_viewer_.GetInputs()[0];
+            if (input_is_loop_iteration_number) {
+              // as the value inside the OrtValue gets changed by the Loop implementation on each iteration
+              // (so it can re-use the OrtValue instance) if it is also a subgraph output it must be allocated
+              // so a copy of the current value is returned, so leave alloc_kind as kAllocateOutput
+            } else {
+              const auto& input_name = input->Name();
+              const auto input_index = Index(input_name);
+
+              const auto& alloc_plan = AllocPlan(input_index);
+              if (alloc_plan.alloc_kind == AllocKind::kPreExisting) {
+                Reuse(input_index, current, AllocKind::kShare);
+              }
             }
           }
         } else if (IsNonTensor(*node_output)) {
           // we do not try sharing-optimization for non-tensors
           AllocPlan(current).alloc_kind = AllocKind::kAllocate;
-        } else if (FindReusableInput(*pnode, output_arg_num, &reused)) {
+        } else if (FindReusableInput(*pnode, static_cast<int>(output_arg_def_index), &reused)) {
           // Reuse one of this node's input buffers as the output buffer (for in-place update)
           Reuse(reused, current, AllocKind::kReuse);
-        } else if (!context_.IsParallelExecutionEnabled() && FindReusableTensor(*node_output, &reused)) {
+        } else if (!context_.IsParallelExecutionEnabled() &&
+                   FindReusableTensor(*node_output, &reused)) {
           // Reuse an available (dead) buffer for this output, this is only for sequential execution.
           Reuse(reused, current, AllocKind::kReuse);
         } else {
           // otherwise: allocate a new buffer for this output
           AllocPlan(current).alloc_kind = AllocKind::kAllocate;
         }
-        output_arg_num++;
       }
+
       // determine if inputs of *pnode can be freed:
       for (auto node_input : pnode->InputDefs()) {
         if (node_input->Exists()) {
           auto& sym = node_input->Name();
           auto original = Buffer(Index(sym));
-          if (0 == --UseCount(original))
+          // The index will be -1 if it's an initializer that was removed as part of a temporary workaround.
+          // See comments in the OrtValueInfo definition.
+          if ((original != -1) && (0 == DecrementUseCount(original)))
             freelist_.push_front(FreeBufferInfo(original, program_counter));
         }
       }
@@ -580,7 +666,9 @@ class PlannerImpl {
         if (node_input->Exists()) {
           auto& sym = node_input->Name();
           auto original = Buffer(Index(sym));
-          if (0 == --UseCount(original))
+          // The index will be -1 if it's an initializer that was removed as part of a temporary workaround.
+          // See comments in the OrtValueInfo definition.
+          if ((original != -1) && (0 == DecrementUseCount(original)))
             freelist_.push_front(FreeBufferInfo(original, program_counter));
         }
       }
@@ -590,7 +678,7 @@ class PlannerImpl {
         if (node_output->Exists()) {
           auto& sym = node_output->Name();
           auto original = Buffer(Index(sym));
-          if (0 == --UseCount(original))
+          if (0 == DecrementUseCount(original))
             freelist_.push_front(FreeBufferInfo(original, program_counter));
         }
       }
@@ -675,12 +763,12 @@ class PlannerImpl {
     // TODO: unclear why we should go through a string-representation of type
     auto ptype = nodearg.Type();
     auto& type_proto = ONNX_NAMESPACE::Utils::DataTypeUtils::ToTypeProto(ptype);
-    return !type_proto.has_tensor_type();
+    return !utils::HasTensorType(type_proto);
   }
 };  // namespace onnxruntime
 
 Status PlannerImpl::CreatePlan() {
-  auto& p_graph_nodes = graph_viewer_.GetNodesInTopologicalOrder();
+  auto& p_graph_nodes = graph_viewer_.GetNodesInTopologicalOrder(context_.GetExecutionOrder());
 
   int num_ml_values = ort_value_name_idx_map_.MaxIdx() + 1;
 
@@ -707,17 +795,20 @@ Status PlannerImpl::CreatePlan() {
   return Status::OK();
 }
 
-Status SequentialPlanner::CreatePlan(const Node* parent_node, const onnxruntime::GraphViewer& graph_viewer,
-                                     const std::vector<const NodeArg*>& outer_scope_node_args,
-                                     const ExecutionProviders& providers, const KernelRegistryManager& kernel_registry,
-                                     const OrtValueNameIdxMap& ort_value_name_idx_map,
-                                     const ISequentialPlannerContext& context,
-                                     std::unique_ptr<SequentialExecutionPlan>& plan) {
+Status SequentialPlanner::CreatePlan(
+    const Node* parent_node,
+    const onnxruntime::GraphViewer& graph_viewer,
+    const std::vector<const NodeArg*>& outer_scope_node_args,
+    const ExecutionProviders& providers,
+    const std::unordered_map<NodeIndex, gsl::not_null<const KernelCreateInfo*>>& kernel_create_info_map,
+    const OrtValueNameIdxMap& ort_value_name_idx_map,
+    const ISequentialPlannerContext& context,
+    std::unique_ptr<SequentialExecutionPlan>& plan) {
   // allocate/reset here so we know it's clean
-  plan = std::make_unique<SequentialExecutionPlan>();
+  plan = onnxruntime::make_unique<SequentialExecutionPlan>();
 
-  PlannerImpl planner(parent_node, graph_viewer, outer_scope_node_args, providers, kernel_registry,
-                      ort_value_name_idx_map, context, *plan);
+  PlannerImpl planner(parent_node, graph_viewer, outer_scope_node_args, providers,
+                      kernel_create_info_map, ort_value_name_idx_map, context, *plan);
 
   return planner.CreatePlan();
 }

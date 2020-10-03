@@ -1,27 +1,24 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 #pragma once
 
-// default to gemmlowp when building for arm devices
-#ifndef USE_GEMMLOWP
-#if defined(_M_ARM64) || defined(__aarch64__)
-#define USE_GEMMLOWP
-#endif
-#if defined(_M_ARM) || defined(__arm__)
-#define USE_GEMMLOWP
-#endif
+#include "core/platform/threadpool.h"
+
+#include <cfenv>
+#include <cmath>
+
+#if defined(_M_AMD64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+#define MLAS_SUPPORTS_GEMM_U8X8
 #endif
 
-#ifdef USE_GEMMLOWP
-#include "core/util/gemmlowp_common.h"
-#else
-#include "core/mlas/inc/mlas.h"
+#if defined(_M_AMD64) || defined(__x86_64__)
+#define MLAS_SUPPORTS_PACKED_GEMM_U8X8
 #endif
-#include "core/platform/threadpool.h"
-#include <mutex>
-#include <thread>
 
 namespace onnxruntime {
 
-void QGemmu8u8_s32(
+void QGemm(
     int M,
     int N,
     int K,
@@ -31,8 +28,32 @@ void QGemmu8u8_s32(
     const uint8_t* rhs_data,
     int ldb,
     const uint8_t rhs_offset,
+    bool rhs_signed,
     int32_t* result_data,
     int ldc,
     concurrency::ThreadPool* thread_pool);
+
+void QGemm(
+    int M,
+    int N,
+    int K,
+    const uint8_t* lhs_data,
+    int lda,
+    const uint8_t lhs_offset,
+    const uint8_t* rhs_data,
+    int ldb,
+    const uint8_t rhs_offset,
+    bool rhs_signed,
+    float* result_data,
+    int ldc,
+    const float* result_scale,
+    const float* bias,
+    concurrency::ThreadPool* thread_pool);
+
+inline float RoundHalfToEven(float input) {
+  std::fesetround(FE_TONEAREST);
+  auto result = std::nearbyintf(input);
+  return result;
+}
 
 }  // namespace onnxruntime

@@ -35,7 +35,7 @@ class LoggingTestsFixture : public ::testing::Test {
     // and filters user data so that can also be tested
 #if !defined(SKIP_DEFAULT_LOGGER_TESTS)
     const bool filter_user_data = false;
-    default_logging_manager_ = std::make_unique<LoggingManager>(
+    default_logging_manager_ = onnxruntime::make_unique<LoggingManager>(
         std::unique_ptr<ISink>{new CLogSink {}}, Severity::kWARNING, filter_user_data,
         InstanceType::Default, &default_logger_id, /*default_max_vlog_level*/ -1);
 #endif
@@ -145,18 +145,20 @@ TEST_F(LoggingTestsFixture, TestLoggerFiltering) {
 /// <summary>
 /// Tests that the logging manager constructor validates its usage correctly.
 /// </summary>
+#if !defined(ORT_NO_EXCEPTIONS)
 TEST_F(LoggingTestsFixture, TestLoggingManagerCtor) {
   // throw if sink is null
   EXPECT_THROW((LoggingManager{std::unique_ptr<ISink>{nullptr}, Severity::kINFO, false,
                                InstanceType::Temporal}),
-               std::logic_error);
+               ::onnxruntime::OnnxRuntimeException);
 
   // can't have two logging managers with InstanceType of Default.
   // this should clash with LoggingTestsFixture::default_logging_manager_
   EXPECT_THROW((LoggingManager{std::unique_ptr<ISink>{new MockSink{}}, Severity::kINFO, false,
                                InstanceType::Default}),
-               std::logic_error);
+               ::onnxruntime::OnnxRuntimeException);
 }
+#endif
 
 /// <summary>
 /// Tests that the conditional logging macros work correctly.

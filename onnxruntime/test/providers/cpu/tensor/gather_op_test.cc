@@ -3,6 +3,7 @@
 
 #include "gtest/gtest.h"
 #include "test/providers/provider_test_utils.h"
+#include "test/util/include/default_providers.h"
 
 namespace onnxruntime {
 namespace test {
@@ -66,7 +67,7 @@ TEST(GatherOpTest, Gather_invalid_axis) {
 }
 
 TEST(GatherOpTest, Gather_invalid_index_cpu) {
-  OpTester test("Gather");
+  OpTester test("Gather"); 
   // Invalid index 3. data[3] does not exist.
   test.AddAttribute<int64_t>("axis", 0LL);
   test.AddInput<float>("data", {3, 4},
@@ -76,7 +77,9 @@ TEST(GatherOpTest, Gather_invalid_index_cpu) {
   test.AddInput<int32_t>("indices", {3}, {0LL, 1L, 1000L});
   test.AddOutput<float>("output", {1}, {1.0f});
 
-  test.Run(OpTester::ExpectResult::kExpectFailure, "Mismatch between number of source and target dimensions.");
+  // On Cuda it is impossible to dereference indecies memory on CPU so the check can not run
+  test.Run(OpTester::ExpectResult::kExpectFailure, "indices element out of data bounds, idx=1000 must be within the inclusive range [-3,2]",
+           {kCudaExecutionProvider, kOpenVINOExecutionProvider,kNGraphExecutionProvider, kDnnlExecutionProvider, kNupharExecutionProvider, kTensorrtExecutionProvider});
 }
 
 #ifdef USE_CUDA
@@ -95,7 +98,7 @@ TEST(GatherOpTest, Gather_invalid_index_gpu) {
                          0.0f, 0.0f, 0.0f, 0.0f});
 
   //On GPU, just set the value to 0 instead of report error. exclude all other providers
-  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kCpuExecutionProvider, kMklDnnExecutionProvider, kNupharExecutionProvider, kTensorrtExecutionProvider});
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kCpuExecutionProvider, kDnnlExecutionProvider, kNupharExecutionProvider, kTensorrtExecutionProvider});
 }
 #endif
 
@@ -186,7 +189,7 @@ TEST(GatherOpTest, Gather_axis1_indices2d_int32) {
                           {1, 0, 2, 1,
                            11, 10, 12, 11,
                            21, 20, 22, 21});
-  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider}); //TensorRT: Input batch size is inconsistent
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider});  //TensorRT: Input batch size is inconsistent
 }
 
 TEST(GatherOpTest, Gather_axis1_indices2d_uint32) {
@@ -220,7 +223,12 @@ TEST(GatherOpTest, Gather_axis1_indices2d_int16) {
                           {1, 0, 2, 1,
                            11, 10, 12, 11,
                            21, 20, 22, 21});
-  test.Run();
+
+  #if defined(OPENVINO_CONFIG_MYRIAD)
+    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider});
+  #else
+    test.Run();
+  #endif    
 }
 
 TEST(GatherOpTest, Gather_axis1_indices2d_uint16) {
@@ -254,7 +262,11 @@ TEST(GatherOpTest, Gather_axis1_indices2d_int8) {
                          {1, 0, 2, 1,
                           11, 10, 12, 11,
                           21, 20, 22, 21});
-  test.Run();
+  #if defined(OPENVINO_CONFIG_MYRIAD)
+    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider, kOpenVINOExecutionProvider});  // OpenVINO: Disabled temporarily
+  #else
+    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider});  //TensorRT: Assertion `regionRanges != nullptr' failed
+  #endif
 }
 
 TEST(GatherOpTest, Gather_axis1_indices2d_string) {
@@ -288,7 +300,11 @@ TEST(GatherOpTest, Gather_axis1_indices2d_bool) {
                        {false, true, true, false,
                         true, true, false, true,
                         true, false, false, true});
-  test.Run();
+  #if defined(OPENVINO_CONFIG_MYRIAD)
+    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider});  // OpenVINO: Disabled temporarily
+  #else
+    test.Run();
+  #endif
 }
 
 TEST(GatherOpTest, Gather_perf) {
@@ -305,5 +321,25 @@ TEST(GatherOpTest, Gather_perf) {
   test.AddOutput<int32_t>("output", {800, 1, 100}, output);
   test.Run();
 }
+
+TEST(GatherOpTest, Gather_axis1_neg_indices2d_int8) {
+  OpTester test("Gather", 11);
+  test.AddAttribute<int64_t>("axis", 1LL);
+  test.AddInput<int8_t>("data", {3, 3},
+                        {0, 1, 2,
+                         10, 11, 12,
+                         20, 21, 22});
+  test.AddInput<int32_t>("indices", {2, 2},
+                         {-2, -3,
+                          -1, -2});
+  test.AddOutput<int8_t>("output", {3, 2, 2},
+                         {1, 0, 2, 1,
+                          11, 10, 12, 11,
+                          21, 20, 22, 21});
+  // OpenVINO EP: Disabled due to accuracy issues
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider,kOpenVINOExecutionProvider});  //TensorRT: Assertion `regionRanges != nullptr' failed
+
+}
+
 }  // namespace test
 }  // namespace onnxruntime

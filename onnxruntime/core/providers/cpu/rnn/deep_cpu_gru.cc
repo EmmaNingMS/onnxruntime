@@ -1,7 +1,5 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
-#include "core/platform/threadpool.h"
-#include "core/framework/op_kernel_context_internal.h"
 
 // there's no way to use a raw pointer as the copy destination with std::copy_n
 // (which gsl::copy uses with span::data() which returns a raw pointer) with the 14.11 toolset
@@ -12,16 +10,6 @@
 #endif
 
 #include "core/providers/cpu/rnn/deep_cpu_gru.h"
-
-#include <algorithm>
-#include <future>
-#include <stdexcept>
-
-#include "core/common/logging/logging.h"
-#include "core/framework/allocator.h"
-#include "core/framework/tensor.h"
-
-#include "core/platform/ort_mutex.h"
 
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -253,23 +241,21 @@ Status DeepCpuGruOp::Compute(OpKernelContext* context) const {
 
   Status status;
 
-  auto data_type = X.DataType();
-  if (data_type == DataTypeImpl::GetType<float>())
+  if (X.IsDataType<float>())
     status = ComputeImpl<float>(*context);
-  else if (data_type == DataTypeImpl::GetType<double>()) {
+  else if (X.IsDataType<double>()) {
     /* Need to update all the helpers to support double...
     status = ComputeImpl<double>(*context); */
     ORT_NOT_IMPLEMENTED("GRU operator does not support double yet");
   } else
-    ORT_THROW("Invalid data type for GRU operator of ", data_type);
+    ORT_THROW("Invalid data type for GRU operator of ", X.DataType());
 
   return status;
 }
 
 template <typename T>
 Status DeepCpuGruOp::ComputeImpl(OpKernelContext& context) const {
-  auto ctx_internal = static_cast<OpKernelContextInternal*>(&context);
-  concurrency::ThreadPool* thread_pool = ctx_internal->GetOperatorThreadPool();
+  concurrency::ThreadPool* thread_pool = context.GetOperatorThreadPool();
 
   const Tensor& X = *context.Input<Tensor>(0);  // inputs. [seq_length, batch_size, input_size]
   const Tensor& W = *context.Input<Tensor>(1);  // weights. [num_directions, 3*hidden_size, input_size]
@@ -286,7 +272,7 @@ Status DeepCpuGruOp::ComputeImpl(OpKernelContext& context) const {
   int batch_size = gsl::narrow<int>(X_shape[1]);
   int input_size = gsl::narrow<int>(X_shape[2]);
 
-  auto status = ValidateCommonRnnInputs(X, W, R, B, 3, sequence_lens, initial_h, num_directions_, hidden_size_);
+  auto status = ValidateCommonRnnInputs(X, W.Shape(), R.Shape(), B, 3, sequence_lens, initial_h, num_directions_, hidden_size_);
   ORT_RETURN_IF_ERROR(status);
 
   // GRU outputs are optional but must be in the same order
@@ -520,7 +506,7 @@ void UniDirectionalGru<T>::Compute(const gsl::span<const T>& inputs_arg,
   const bool output_sequence = !outputs.empty();
 
   if (direction_ == kReverse) {
-    ReverseSequence(inputs, inputs_reverse_, sequence_lengths, seq_length_, batch_size_, input_size_, 1);
+    ReverseSequence(inputs, inputs_reverse_, sequence_lengths, seq_length_, batch_size_, input_size_, 1, ttp_);
     // DumpMatrix("Reversed inputs", inputs_reverse_.data(), seq_length_ * batch_size_, input_size_);
 
     inputs = inputs_reverse_;
@@ -540,21 +526,17 @@ void UniDirectionalGru<T>::Compute(const gsl::span<const T>& inputs_arg,
   const int total_rows = max_sequence_length * batch_size_;
 
   float alpha = 1.0f;
-  float beta = 0.0f;  // zero out outputZRH_ when calling ComputeGemm.
 
   // apply weights to all the inputs
   ComputeGemm(total_rows, hidden_size_x3, input_size_, alpha,
               inputs.cbegin(), inputs.cend(),
               input_size_,
               input_weights.cbegin(), input_weights.cend(),
-              input_size_, beta,
+              input_size_, 0.f,
               outputZRH_.begin(), outputZRH_.end(),
               hidden_size_x3, ttp_);
 
   DumpMatrix("inputs with weights applied", outputZRH_.data(), seq_length_ * batch_size_ * 3, hidden_size_);
-
-  // set to 1 so the weighted inputs in outputZRH_ are added to the result in the next call to ComputeGemm
-  beta = 1.0f;
 
   // output shape is [seq_length, num_directions, batch_size, hidden_size]
   // if we are doing 2 directions and this is the forward pass we're writing to the real output so
@@ -580,11 +562,11 @@ void UniDirectionalGru<T>::Compute(const gsl::span<const T>& inputs_arg,
   span_T_iter cur_h_local = cur_h_.begin();
   span_T_iter cur_h_local_end = cur_h_.end();
 
-  span_T_const_iter batched_bias_WRz_local;
-  span_T_const_iter batched_bias_WRr_local;
-  span_T_const_iter batched_bias_WRh_local;
-  span_T_const_iter batched_bias_Wh_local;
-  span_T_const_iter batched_bias_Rh_local;
+  span_T_const_iter batched_bias_WRz_local{};
+  span_T_const_iter batched_bias_WRr_local{};
+  span_T_const_iter batched_bias_WRh_local{};
+  span_T_const_iter batched_bias_Wh_local{};
+  span_T_const_iter batched_bias_Rh_local{};
 
   if (use_bias_) {
     batched_bias_WRz_local = batched_bias_WRz_.cbegin();
@@ -613,7 +595,7 @@ void UniDirectionalGru<T>::Compute(const gsl::span<const T>& inputs_arg,
                 prev_Ht, prev_Ht_end,
                 hidden_size_,
                 recurrent_weightsZR.cbegin(), recurrent_weightsZR.cend(),
-                hidden_size_, beta,
+                hidden_size_, 1.f,  // beta == 1 so we add existing values in outputZRH_
                 outputZRH_.begin() + out_added_offset, outputZRH_.end(),
                 hidden_size_x3, ttp_);
 
@@ -622,15 +604,21 @@ void UniDirectionalGru<T>::Compute(const gsl::span<const T>& inputs_arg,
 
     if (linear_before_reset_) {
       // copy Rbh to linear output
-      gsl::copy(batched_bias_Rh_.subspan(batched_bias_Rh_local - batched_bias_Rh_.begin(), batched_bias_Rh_local_end - batched_bias_Rh_local), linear_output_);
+      if (use_bias_) {
+        gsl::copy(batched_bias_Rh_.subspan(batched_bias_Rh_local - batched_bias_Rh_.begin(),
+                                           batched_bias_Rh_local_end - batched_bias_Rh_local),
+                  linear_output_);
+      }
 
       // compute Ht-1 * (Rh^T) + Rbh
       ComputeGemm(batch_size_, hidden_size_, hidden_size_, alpha,
                   prev_Ht, prev_Ht_end,  // Ht-1
                   hidden_size_,
                   recurrent_weightsH.cbegin(), recurrent_weightsH.cend(),  // Rh^T
-                  hidden_size_, beta,
-                  linear_output_.begin(), linear_output_.end(),  // pre: Rbh, post:output
+                  hidden_size_,
+                  use_bias_ ? 1.f : 0.f,  // don't add values in linear_output_ if no bias input
+                  linear_output_.begin(),
+                  linear_output_.end(),  // pre: Rbh if use_bias_, post:output
                   hidden_size_, ttp_);
 
       DumpMatrix("Ht-1 * (Rh^T) + Rbh " + seqno_str, linear_output_.data(), batch_size_, hidden_size_);
@@ -700,7 +688,7 @@ void UniDirectionalGru<T>::Compute(const gsl::span<const T>& inputs_arg,
                   cur_h_local, cur_h_local_end,  // rt (.) Ht-1
                   hidden_size_,
                   recurrent_weightsH.cbegin(), recurrent_weightsH.cend(),  // Rh^T
-                  hidden_size_, beta,
+                  hidden_size_, 1.f,                                       // beta == 1 to add Xt*(Wh^T) from out_H
                   out_H, outputZRH_.end(),
                   hidden_size_x3, ttp_);
     }
@@ -818,7 +806,7 @@ void UniDirectionalGru<T>::Compute(const gsl::span<const T>& inputs_arg,
   if (output_sequence && direction_ == kReverse) {
     ReverseSequence<T>(outputs, original_outputs,
                        sequence_lengths, seq_length_,
-                       batch_size_, hidden_size_, num_directions);
+                       batch_size_, hidden_size_, num_directions, ttp_);
   }
 }
 
@@ -834,10 +822,13 @@ void UniDirectionalGru<T>::AllocateBuffers() {
     if (linear_before_reset_) {
       batched_bias_Wh_ = Allocate(allocator_, batch_size_ * hidden_size_, batched_bias_Wh_ptr_);
       batched_bias_Rh_ = Allocate(allocator_, batch_size_ * hidden_size_, batched_bias_Rh_ptr_);
-      linear_output_ = Allocate(allocator_, batch_size_ * hidden_size_, linear_output_ptr_);
     } else {
       batched_bias_WRh_ = Allocate(allocator_, batch_size_ * hidden_size_, batched_bias_WRh_ptr_);
     }
+  }
+
+  if (linear_before_reset_) {
+    linear_output_ = Allocate(allocator_, batch_size_ * hidden_size_, linear_output_ptr_);
   }
 
   auto batch_times_seq_length = batch_size_ * seq_length_;

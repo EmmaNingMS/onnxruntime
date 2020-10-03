@@ -1,37 +1,60 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "core/common/exceptions.h"
-#include "core/common/status.h"
-#include "core/common/logging/logging.h"
-#include "core/graph/graph_viewer.h"
-#include "core/graph/op.h"
-#include "onnx/defs/schema.h"
+#include "core/common/common.h"
 #include "core/framework/op_kernel.h"
-#include "onnx/defs/schema.h"
-#include "gsl/span"
+#include "core/framework/tensorprotoutils.h"
+#include "core/graph/onnx_protobuf.h"
+#include "core/graph/op.h"
+#include "gsl/gsl"
+
 using namespace ONNX_NAMESPACE;
 using namespace ::onnxruntime::common;
 namespace onnxruntime {
 
-#define ORT_DEFINE_GET_ATTR(IMPL_T, T, type)                                                        \
-  template <>                                                                                               \
-  template <>                                                                                               \
-  Status OpNodeProtoHelper<IMPL_T>::GetAttr<T>(                                                             \
-      const std::string& name, T* value) const {                                                            \
-    const AttributeProto* attr = TryGetAttribute(name);                                                     \
-    if (!attr) {                                                                                            \
-      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "No attribute with name:'", name, "'is defined.");  \
-    }                                                                                                       \
-    if (!attr->has_##type()) {                                                                              \
-      return Status(ONNXRUNTIME, FAIL, "Attibute name and type don't match");                               \
-    } else {                                                                                                \
-      *value = static_cast<T>(attr->type());                                                                \
-      return Status::OK();                                                                                  \
-    }                                                                                                       \
+template <class T>
+bool HasTyped(const AttributeProto*);
+
+template <>
+inline bool HasTyped<float>(const AttributeProto* attr) {
+  return utils::HasFloat(*attr);
+}
+template <>
+inline bool HasTyped<int64_t>(const AttributeProto* attr) {
+  return utils::HasInt(*attr);
+}
+template <>
+inline bool HasTyped<std::string>(const AttributeProto* attr) {
+  return utils::HasString(*attr);
+}
+
+template <>
+inline bool HasTyped<TensorProto>(const AttributeProto* attr) {
+  return utils::HasTensor(*attr);
+}
+template <>
+inline bool HasTyped<GraphProto>(const AttributeProto* attr) {
+  return utils::HasGraph(*attr);
+}
+
+#define ORT_DEFINE_GET_ATTR(IMPL_T, T, type)                                                       \
+  template <>                                                                                      \
+  template <>                                                                                      \
+  Status OpNodeProtoHelper<IMPL_T>::GetAttr<T>(                                                    \
+      const std::string& name, T* value) const {                                                   \
+    const AttributeProto* attr = TryGetAttribute(name);                                            \
+    if (!attr) {                                                                                   \
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "No attribute with name:'", name, "'is defined."); \
+    }                                                                                              \
+    if (!HasTyped<T>(attr)) {                                                                      \
+      return Status(ONNXRUNTIME, FAIL, "Attibute name and type don't match");                      \
+    } else {                                                                                       \
+      *value = static_cast<T>(attr->type());                                                       \
+      return Status::OK();                                                                         \
+    }                                                                                              \
   }
 
-#define ORT_DEFINE_GET_ATTRS(IMPL_T, T, list)                              \
+#define ORT_DEFINE_GET_ATTRS(IMPL_T, T, list)                                      \
   template <>                                                                      \
   template <>                                                                      \
   Status OpNodeProtoHelper<IMPL_T>::GetAttrs<T>(                                   \
@@ -54,13 +77,14 @@ namespace onnxruntime {
     if (!attr) {                                                                   \
       return Status(ONNXRUNTIME, FAIL, "No attribute with this name is defined."); \
     }                                                                              \
-    ORT_ENFORCE(values.size() == attr->list##_size());                     \
+    ORT_ENFORCE(values.size() == static_cast<size_t>(attr->list##_size()));        \
     for (int i = 0; i < attr->list##_size(); ++i) {                                \
       values[i] = static_cast<T>(attr->list(i));                                   \
     }                                                                              \
     return Status::OK();                                                           \
   }
 
+#if !defined(ORT_MINIMAL_BUILD)
 #define ORT_DEFINE_GET_ATTR_SPECIALIZATIONS(type, list)   \
   ORT_DEFINE_GET_ATTR(ProtoHelperNodeContext, type, list) \
   ORT_DEFINE_GET_ATTR(InferenceContext, type, list)
@@ -68,6 +92,13 @@ namespace onnxruntime {
 #define ORT_DEFINE_GET_ATTRS_SPECIALIZATIONS(type, list)   \
   ORT_DEFINE_GET_ATTRS(ProtoHelperNodeContext, type, list) \
   ORT_DEFINE_GET_ATTRS(InferenceContext, type, list)
+#else
+#define ORT_DEFINE_GET_ATTR_SPECIALIZATIONS(type, list) \
+  ORT_DEFINE_GET_ATTR(ProtoHelperNodeContext, type, list)
+
+#define ORT_DEFINE_GET_ATTRS_SPECIALIZATIONS(type, list) \
+  ORT_DEFINE_GET_ATTRS(ProtoHelperNodeContext, type, list)
+#endif
 
 ORT_DEFINE_GET_ATTR_SPECIALIZATIONS(float, f)
 ORT_DEFINE_GET_ATTR_SPECIALIZATIONS(int64_t, i)
@@ -127,8 +158,10 @@ uint32_t OpNodeProtoHelper<Impl_t>::GetPrimitiveAttrElementCount(AttributeProto_
       case AttributeProto_AttributeType_UNDEFINED:
       case AttributeProto_AttributeType_TENSOR:
       case AttributeProto_AttributeType_GRAPH:
+      case AttributeProto_AttributeType_SPARSE_TENSOR:
       case AttributeProto_AttributeType_TENSORS:
       case AttributeProto_AttributeType_GRAPHS:
+      case AttributeProto_AttributeType_SPARSE_TENSORS:
       default:
         return 0;
     }
@@ -144,6 +177,8 @@ bool OpNodeProtoHelper<Impl_t>::HasPrimitiveAttribute(AttributeProto_AttributeTy
 }
 
 template class OpNodeProtoHelper<ProtoHelperNodeContext>;
+#if !defined(ORT_MINIMAL_BUILD)
 template class OpNodeProtoHelper<InferenceContext>;
+#endif
 
 }  // namespace onnxruntime

@@ -2,8 +2,8 @@
 // Licensed under the MIT License.
 
 #include "gtest/gtest.h"
+#include "test/providers/provider_test_utils.h"
 #include "test/common/tensor_op_test_utils.h"
-
 
 using namespace ONNX_NAMESPACE;
 namespace onnxruntime {
@@ -20,7 +20,8 @@ TEST(TensorOpTest, Reshape) {
   test.AddInput<float>("data", {2, 3}, std::vector<float>(6, 1.0f));
   test.AddInput<int64_t>("shape", {3}, {-1, 0, 2});
   test.AddOutput<float>("reshaped", {1, 3, 2}, std::vector<float>(6, 1.0f));
-  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kNupharExecutionProvider});  // Nuphar only supports reshape shape from initializer
+  //TensorRT doesn't support dynamic shape tensor for now
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kNupharExecutionProvider, kTensorrtExecutionProvider});  // Nuphar only supports reshape shape from initializer
 }
 
 TEST(TensorOpTest, ReshapeWithEmptyDim) {
@@ -29,7 +30,33 @@ TEST(TensorOpTest, ReshapeWithEmptyDim) {
   test.AddInput<float>("data", {1, 1, 1}, std::vector<float>(1, 1.0f));
   test.AddInput<int64_t>("shape", {0}, {}, true);
   test.AddOutput<float>("reshaped", {}, std::vector<float>(1, 1.0f));
-  test.Run();
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider});  // TensorRT doesn't support empty dimension
+}
+
+TEST(TensorOpTest, ReshapeWithEmptyInput) {
+  OpTester test("Reshape");
+  test.AddInput<float>("data", {0, 10}, std::vector<float>());
+  test.AddInput<int64_t>("shape", {3}, {0, 10, 1}, false);
+  test.AddOutput<float>("reshaped", {0, 10, 1}, std::vector<float>());
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider});  // TensorRT doesn't support empty dimension
+}
+
+TEST(TensorOpTest, ReshapeWithEmptyInputAndDynamicShape) {
+  {
+    OpTester test("Reshape");
+    test.AddInput<float>("data", {1, 0}, std::vector<float>());
+    test.AddInput<int64_t>("shape", {3}, {1, 0, -1}, false);
+    test.AddOutput<float>("reshaped", {1, 0, 1}, {});
+    test.Run(OpTester::ExpectResult::kExpectFailure, "The input tensor cannot be reshaped to the requested shape", {kTensorrtExecutionProvider});  // TensorRT doesn't support empty dimension
+  }
+
+  {
+    OpTester test("Reshape");
+    test.AddInput<float>("data", {1, 0}, std::vector<float>());
+    test.AddInput<int64_t>("shape", {3}, {1, 1, -1}, false);
+    test.AddOutput<float>("reshaped", {1, 1, 0}, {});
+    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider});  // TensorRT doesn't support empty dimension
+  }
 }
 
 TEST(TensorOpTest, ReshapeWithInitializer) {
@@ -46,7 +73,7 @@ TEST(TensorOpTest, ShapeTest2D) {
 
   test.AddInput<float>("data", {2, 3}, std::vector<float>(6, 1.0f));
   test.AddOutput<int64_t>("shape", {2}, {2, 3});
-  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider});//TensorRT: volume of dimensions is not consistent with weights size
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider});  //TensorRT: volume of dimensions is not consistent with weights size
 }
 
 TEST(TensorOpTest, ShapeTest3D) {
@@ -54,7 +81,7 @@ TEST(TensorOpTest, ShapeTest3D) {
 
   test.AddInput<float>("data", {2, 3, 4}, std::vector<float>(24, 1.0f));
   test.AddOutput<int64_t>("shape", {3}, {2, 3, 4});
-  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider});//TensorRT: volume of dimensions is not consistent with weights size
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider});  //TensorRT: volume of dimensions is not consistent with weights size
 }
 
 template <typename SrcType,
@@ -264,8 +291,11 @@ TEST(TensorOpTest, CastFromFloat16) {
 
 TEST(TensorOpTest, CastFromString) {
   const std::vector<int64_t> shape{2, 2, 2};
-  std::initializer_list<std::string> string_data = {"-inf", "+INF", "2.0f", "3.0f", "4.0f", "5.0f", "NaN", "nan"};
-  const std::initializer_list<float> float_output = {-(std::numeric_limits<float>::infinity()), std::numeric_limits<float>::infinity(), 2.0f, 3.0f, 4.0f, 5.0f, NAN, NAN};
+  std::initializer_list<std::string> string_data = {"-inf", "+INF", "0.9767611f", "0.28280696f",
+                                                    "-0.12019656f", "5.0f", "NaN", "nan"};
+  const std::initializer_list<float> float_output = {-(std::numeric_limits<float>::infinity()), std::numeric_limits<float>::infinity(),
+                                                     0.9767611f, 0.28280696f,
+                                                     -0.12019656f, 5.0f, NAN, NAN};
   TestCastOp(string_data, float_output, shape, TensorProto::FLOAT);
 
   std::initializer_list<std::string> int_16_string_data = {"0", "1", "2", "3", "4", "5", "-32768", "32767"};
@@ -279,8 +309,13 @@ TEST(TensorOpTest, CastFromString) {
 
 TEST(TensorOpTest, CastToString) {
   const std::vector<int64_t> shape{2, 2, 2};
-  const std::initializer_list<float> float_input = {NAN, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity()};
-  std::initializer_list<std::string> string_output = {"NaN", "1", "2", "3", "4", "5", "-INF", "INF"};
+  const std::initializer_list<float> float_input = {NAN, -1.f, 0.0391877927f, 0.296140194f, -0.120196559f, 5.0f,
+                                                    -std::numeric_limits<float>::infinity(),
+                                                    std::numeric_limits<float>::infinity()};
+
+  // float output precision is 8, so the expected output differs slightly from the input due to that
+  std::initializer_list<std::string> string_output = {"NaN", "-1", "0.039187793", "0.29614019",
+                                                      "-0.12019656", "5", "-INF", "INF"};
   TestCastOp(float_input, string_output, shape, TensorProto::STRING);
 
   std::initializer_list<std::string> int_string_data = {"0", "1", "2", "3", "4", "5", "6", "7"};
@@ -375,7 +410,6 @@ void MeanVarianceNormalizationFunctionAcrossChannels(std::vector<int64_t> axes) 
 }
 
 TEST(TensorOpTest, MeanVarianceNormalizationCPUTest) {
-
   // axes: {0, 1, 2, 3} for across_channels
   MeanVarianceNormalizationFunctionAcrossChannels({0, 1, 2, 3});
 

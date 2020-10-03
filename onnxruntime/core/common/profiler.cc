@@ -7,6 +7,8 @@ namespace onnxruntime {
 namespace profiling {
 using namespace std::chrono;
 
+std::atomic<size_t> Profiler::global_max_num_events_{1000 * 1000};
+
 #ifdef ENABLE_STATIC_PROFILER_INSTANCE
 Profiler* Profiler::instance_ = nullptr;
 
@@ -18,6 +20,7 @@ profiling::Profiler::~Profiler() {}
 #endif
 
 ::onnxruntime::TimePoint profiling::Profiler::StartTime() const {
+  ORT_ENFORCE(enabled_);
   return std::chrono::high_resolution_clock::now();
 }
 
@@ -45,7 +48,7 @@ void Profiler::StartProfiling(const logging::Logger* custom_logger) {
 template <typename T>
 void Profiler::StartProfiling(const std::basic_string<T>& file_name) {
   enabled_ = true;
-  profile_stream_ = std::ofstream(file_name, std::ios::out | std::ios::trunc);
+  profile_stream_.open(file_name, std::ios::out | std::ios::trunc);
   profile_stream_file_ = ToMBString(file_name);
   profiling_start_time_ = StartTime();
 }
@@ -57,7 +60,7 @@ template void Profiler::StartProfiling<wchar_t>(const std::basic_string<wchar_t>
 
 void Profiler::EndTimeAndRecordEvent(EventCategory category,
                                      const std::string& event_name,
-                                     TimePoint& start_time,
+                                     const TimePoint& start_time,
                                      const std::initializer_list<std::pair<std::string, std::string>>& event_args,
                                      bool /*sync_gpu*/) {
   long long dur = TimeDiffMicroSeconds(start_time);

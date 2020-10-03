@@ -17,20 +17,18 @@ limitations under the License.
 
 #include "core/providers/cpu/generator/random.h"
 
-// build\windows\debug\external\eigen3\unsupported\eigen\cxx11\src/Tensor/Tensor.h(76):
-// warning C4554: '&': check operator precedence for possible error; use parentheses to clarify precedence
-// build\windows\relwithdebinfo\eigen\src\eigen\eigen-eigen-5a0156e40feb\unsupported\eigen\cxx11\src/Tensor/TensorChipping.h(52)
-// warning C4100: 'dim': unreferenced formal parameter
 #ifdef _WIN32
-#pragma warning(disable : 4554 4100)
+#pragma warning(disable : 28020)
 #endif
 
 #include <algorithm>
 #include <chrono>
 #include <random>
+
+#include "core/common/safeint.h"
 #include "core/util/math_cpuonly.h"
-#include "core/util/eigen_common_wrapper.h"
-#include "gsl/span"
+#include "core/common/eigen_common_wrapper.h"
+#include "gsl/gsl"
 using namespace ONNX_NAMESPACE;
 using namespace ::onnxruntime::common;
 namespace onnxruntime {
@@ -169,7 +167,7 @@ static Status MultinomialCompute(OpKernelContext* ctx,
   // BEGIN create temporary tensor
   AllocatorPtr alloc;
   ORT_RETURN_IF_ERROR(ctx->GetTempSpaceAllocator(&alloc));
-  auto cdf_data = static_cast<double*>(alloc->Alloc(sizeof(double) * num_classes));
+  auto cdf_data = static_cast<double*>(alloc->Alloc(SafeInt<size_t>(sizeof(double)) * num_classes));
   BufferUniquePtr cdf_buffer(cdf_data, BufferDeleter(alloc));
   Eigen::array<int64_t, 1> cdf_dims = {{num_classes}};
   auto cdf = EigenVector<double>(cdf_data, cdf_dims);
@@ -235,7 +233,7 @@ Status Multinomial::Compute(OpKernelContext* ctx) const {
     return Status(ONNXRUNTIME, INVALID_ARGUMENT, "num_samples is < 1");
   }
 
-  Tensor* Y = ctx->Output(0, TensorShape({batch_size, num_samples_}));
+  Tensor* Y = ctx->Output(0, {batch_size, num_samples_});
 
   Status status = Status::OK();
   std::lock_guard<onnxruntime::OrtMutex> l(generator_mutex_);
@@ -257,26 +255,21 @@ Status Multinomial::Compute(OpKernelContext* ctx) const {
 
 // create output tensor using shape of input tensor
 static Status CreateOutputTensorFromTensorShape(OpKernelContext* ctx, const Tensor& X, Tensor** Y) {
-  const TensorShape& shape = X.Shape();
-
-  *Y = ctx->Output(0, shape);
+  *Y = ctx->Output(0, X.Shape());
 
   return Status::OK();
 }
 
 static TensorProto::DataType InferDataType(const Tensor& tensor) {
-  auto tensor_type = tensor.DataType();
-  TensorProto::DataType dtype = TensorProto_DataType_UNDEFINED;
+  auto elem_type = tensor.GetElementType();
+  int dtype = TensorProto_DataType_UNDEFINED;
 
-  if (tensor_type == DataTypeImpl::GetType<float>())
-    dtype = TensorProto_DataType_FLOAT;
-  else if (tensor_type == DataTypeImpl::GetType<double>())
-    dtype = TensorProto_DataType_DOUBLE;
-  else {
+  if (TensorProto_DataType_FLOAT == elem_type || TensorProto_DataType_DOUBLE == elem_type) {
+    dtype = elem_type;
+  } else {
     // unsupported. return UNDEFINED
   }
-
-  return dtype;
+  return static_cast<TensorProto::DataType>(dtype);
 }
 
 static Status RandomNormalCompute(float mean, float scale,

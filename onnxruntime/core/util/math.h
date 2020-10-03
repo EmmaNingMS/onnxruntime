@@ -50,17 +50,25 @@ namespace math {
 template <typename T, class Provider>
 void Exp(int N, const T* x, T* y, Provider* provider);
 template <typename T, class Provider>
+void Log(int N, const T* x, T* y, Provider* provider);
+template <typename T, class Provider>
 void Sqr(int N, const T* x, T* y, Provider* provider);
 
-template <typename T, class Provider>
-void Powx(int N, const T* a, T b, T* y, Provider* provider);
 
 #define DECLARE_BINARY_OP(name)                                                     \
   template <typename T, class Provider>                                             \
-  void name(int N, const T* a, const T* b, T* y, Provider* provider);
+  void name(int N, const T* a, const T* b, T* y, Provider* provider);               \
+  template <typename T, class Provider>                                             \
+  void name##ToRow(int M, int N, const T* a, const T* b, T* y, Provider* provider); \
+  template <typename T, class Provider>                                             \
+  void name##ToRow(int M, int N, const T* x, T* y, Provider* provider);             \
+  template <typename T, class Provider>                                             \
+  void name##ToCol(int M, int N, const T* x, T* y, Provider* provider);
 
 DECLARE_BINARY_OP(Add);
+DECLARE_BINARY_OP(Sub);
 DECLARE_BINARY_OP(Mul);
+DECLARE_BINARY_OP(Div);
 
 #undef DECLARE_BINARY_OP
 
@@ -69,6 +77,26 @@ DECLARE_BINARY_OP(Mul);
 template <typename T, class Provider>
 void RowwiseMax(int N, int D, const T* x, T* y,
                 Provider* provider);
+
+// Compute the row-wise sum of a N*D matrix X, and write it to a N
+// dimensional vector y.
+template <typename T, class Provider>
+void RowwiseSum(int N, int D, const T* x, T* y,
+                Provider* provider);
+
+// Sum of vector x, and writes the result to a single value y.
+template <typename T, class Provider>
+void Sum(int N, const T* x, T* y, Provider* provider,
+         Tensor* scratch_ptr = nullptr);
+
+template <typename T, class Provider>
+void Scale(int N, float alpha, const T* x, T* y, Provider* provider);
+
+// Different from the Scale function above, if alpha is passed in
+// as a pointer, we will assume that it lives on the correct execution provider,
+// for example on GPU.
+template <typename T, class Provider>
+void Scale(int N, const float* alpha, const T* x, T* y, Provider* provider);
 
 template <typename T>
 void MatMul(
@@ -88,10 +116,10 @@ void Gemm(
     int64_t M,
     int64_t N,
     int64_t K,
-    float alpha,
+    T alpha,
     const T* A,
     const T* B,
-    float beta,
+    T beta,
     T* C,
     Provider*);
 
@@ -134,6 +162,9 @@ template <typename T, class Provider>
 void Set(int64_t N, T alpha, T* X, Provider* provider);
 
 template <typename T, class Provider>
+void Dot(int N, const T* a, const T* b, T* y, Provider* provider);
+
+template <typename T, class Provider>
 void Axpy(int N, float alpha, const T* x, T* y, Provider* provider);
 
 // Different from the Axpy function above, if alpha is passed in
@@ -142,7 +173,70 @@ void Axpy(int N, float alpha, const T* x, T* y, Provider* provider);
 template <typename T, class Provider>
 void Axpy(int N, const float* alpha, const T* x, T* y, Provider* provider);
 
-template <typename T, class Provider, int order>
+template <typename T, int order>
+struct Im2col {
+  void operator()(
+      const T* data_im,
+      int64_t channels,
+      int64_t height,
+      int64_t width,
+      int64_t kernel_h,
+      int64_t kernel_w,
+      int64_t dilation_h,
+      int64_t dilation_w,
+      int64_t pad_t,
+      int64_t pad_l,
+      int64_t pad_b,
+      int64_t pad_r,
+      int64_t stride_h,
+      int64_t stride_w,
+      T* data_col,
+      T padding_value = 0);
+};
+
+template <typename T>
+struct Im2col<T, StorageOrder::NCHW> {
+  void operator()(
+      const T* data_im,
+      int64_t channels,
+      int64_t height,
+      int64_t width,
+      int64_t kernel_h,
+      int64_t kernel_w,
+      int64_t dilation_h,
+      int64_t dilation_w,
+      int64_t pad_t,
+      int64_t pad_l,
+      int64_t pad_b,
+      int64_t pad_r,
+      int64_t stride_h,
+      int64_t stride_w,
+      T* data_col,
+      T padding_value = 0);
+};
+
+template <typename T>
+struct Im2col<T, StorageOrder::NHWC> {
+  void operator()(
+      const T* data_im,
+      int64_t channels,
+      int64_t height,
+      int64_t width,
+      int64_t kernel_h,
+      int64_t kernel_w,
+      int64_t dilation_h,
+      int64_t dilation_w,
+      int64_t pad_t,
+      int64_t pad_l,
+      int64_t pad_b,
+      int64_t pad_r,
+      int64_t stride_h,
+      int64_t stride_w,
+      T* data_col,
+      T padding_value = 0);
+};
+
+template <typename T, int order>
 struct Im2colNd {
   void operator()(
       const T* data_img,
@@ -156,16 +250,15 @@ struct Im2colNd {
       const int64_t* pad,
       int64_t N,
       T* data_col,
-      Provider* /*provider*/,
       bool accumulate_output = false,
       T padding_value = 0);
 };
 
-template <typename T, class Provider>
-struct Im2colNd<T, Provider, StorageOrder::NCHW> {
+template <typename T>
+struct Im2colNd<T, StorageOrder::NCHW> {
   void operator()(const T* data_img, const int64_t* im_shape, const int64_t* col_shape, int64_t /*img_size*/,
                   int64_t /*col_size*/, const int64_t* kernel_shape, const int64_t* stride, const int64_t* dilation,
-                  const int64_t* pad, int64_t N, T* data_col, Provider* /*provider*/, bool accumulate_output = false,
+                  const int64_t* pad, int64_t N, T* data_col, bool accumulate_output = false,
                   T padding_value = 0) {
     int64_t kernel_size = 1;
     for (int64_t i = 0; i < N; ++i) {
@@ -239,25 +332,6 @@ void Col2imNd(
     const int64_t* pad,
     int64_t N,
     T* data_img,
-    Provider* provider);
-
-template <typename T, class Provider, int order>
-void Im2col(
-    const T* data_im,
-    int64_t channels,
-    int64_t height,
-    int64_t width,
-    int64_t kernel_h,
-    int64_t kernel_w,
-    int64_t dilation_h,
-    int64_t dilation_w,
-    int64_t pad_t,
-    int64_t pad_l,
-    int64_t pad_b,
-    int64_t pad_r,
-    int64_t stride_h,
-    int64_t stride_w,
-    T* data_col,
     Provider* provider);
 
 template <typename T, class Provider, int order>
@@ -364,6 +438,8 @@ constexpr T roundUpPow2(T a) {
 }
 
 uint16_t floatToHalf(float f);
+
+uint16_t doubleToHalf(double f);
 
 float halfToFloat(uint16_t h);
 

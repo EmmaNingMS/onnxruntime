@@ -16,12 +16,40 @@
 namespace onnxruntime {
 namespace cuda {
 
-#define CUDA_RETURN_IF_ERROR(expr) ORT_RETURN_IF_ERROR(CUDA_CALL(expr) ? common::Status::OK() : common::Status(common::ONNXRUNTIME, common::FAIL))
-#define CUBLAS_RETURN_IF_ERROR(expr) ORT_RETURN_IF_ERROR(CUBLAS_CALL(expr) ? common::Status::OK() : common::Status(common::ONNXRUNTIME, common::FAIL))
-#define CUSPARSE_RETURN_IF_ERROR(expr) ORT_RETURN_IF_ERROR(CUSPARSE_CALL(expr) ? common::Status::OK() : common::Status(common::ONNXRUNTIME, common::FAIL))
-#define CURAND_RETURN_IF_ERROR(expr) ORT_RETURN_IF_ERROR(CURAND_CALL(expr) ? common::Status::OK() : common::Status(common::ONNXRUNTIME, common::FAIL))
-#define CUDNN_RETURN_IF_ERROR(expr) ORT_RETURN_IF_ERROR(CUDNN_CALL(expr) ? common::Status::OK() : common::Status(common::ONNXRUNTIME, common::FAIL))
-#define CUDNN2_RETURN_IF_ERROR(expr, m) ORT_RETURN_IF_ERROR(CUDNN_CALL2(expr, m) ? common::Status::OK() : common::Status(common::ONNXRUNTIME, common::FAIL))
+#define CUDA_RETURN_IF_ERROR(expr)               \
+  ORT_RETURN_IF_ERROR(CUDA_CALL(expr)            \
+                          ? common::Status::OK() \
+                          : ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "CUDA error executing ", #expr))
+
+#define CUBLAS_RETURN_IF_ERROR(expr)             \
+  ORT_RETURN_IF_ERROR(CUBLAS_CALL(expr)          \
+                          ? common::Status::OK() \
+                          : ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "CUBLAS error executing ", #expr))
+
+#define CUSPARSE_RETURN_IF_ERROR(expr)           \
+  ORT_RETURN_IF_ERROR(CUSPARSE_CALL(expr)        \
+                          ? common::Status::OK() \
+                          : ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "CUSPARSE error executing ", #expr))
+
+#define CURAND_RETURN_IF_ERROR(expr)             \
+  ORT_RETURN_IF_ERROR(CURAND_CALL(expr)          \
+                          ? common::Status::OK() \
+                          : ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "CURAND error executing ", #expr))
+
+#define CUDNN_RETURN_IF_ERROR(expr)              \
+  ORT_RETURN_IF_ERROR(CUDNN_CALL(expr)           \
+                          ? common::Status::OK() \
+                          : ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "CUDNN error executing ", #expr))
+
+#define CUDNN2_RETURN_IF_ERROR(expr, m)          \
+  ORT_RETURN_IF_ERROR(CUDNN_CALL2(expr, m)       \
+                          ? common::Status::OK() \
+                          : ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "CUDNN2 error executing ", #expr))
+
+#define CUFFT_RETURN_IF_ERROR(expr)              \
+  ORT_RETURN_IF_ERROR(CUFFT_CALL(expr)           \
+                          ? common::Status::OK() \
+                          : ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "CUFFT error executing ", #expr))
 
 // -----------------------------------------------------------------------
 // Base class for CUDA kernels
@@ -31,7 +59,7 @@ class CudaKernel : public OpKernel {
   explicit CudaKernel(const OpKernelInfo& info)
       : OpKernel(info),
         // Is this OK to have a non-const execution provider?
-        provider_(const_cast<CUDAExecutionProvider*>(dynamic_cast<const CUDAExecutionProvider*>(info.GetExecutionProvider()))) {
+        provider_(const_cast<CUDAExecutionProvider*>(static_cast<const CUDAExecutionProvider*>(info.GetExecutionProvider()))) {
   }
 
   Status Compute(OpKernelContext* p_op_kernel_context) const override {
@@ -39,14 +67,22 @@ class CudaKernel : public OpKernel {
     // use this to precisely locate the node where CUDA failure comes from
     //  if (cudaSuccess != cudaDeviceSynchronize())
     //    __debugbreak();
+
+    if (s.IsOK()) {
+      auto err = cudaGetLastError();
+      if (err != cudaSuccess) {
+        s = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "CUDA error ", cudaGetErrorName(err), ":", cudaGetErrorString(err));
+      }
+    }
+
     return s;
   }
 
   virtual Status ComputeInternal(OpKernelContext* p_op_kernel_context) const = 0;
 
   template <typename T>
-  inline IAllocatorUniquePtr<T> AllocateBufferOnCPUPinned(int id, size_t count_or_bytes) const {
-    AllocatorPtr allocator = provider_->GetAllocator(id, OrtMemTypeCPU);
+  inline IAllocatorUniquePtr<T> AllocateBufferOnCPUPinned(size_t count_or_bytes) const {
+    AllocatorPtr allocator = provider_->GetAllocator(CPU_ALLOCATOR_DEVICE_ID, OrtMemTypeCPU);
     if (!allocator)
       return nullptr;
     return IAllocator::MakeUniquePtr<T>(allocator, count_or_bytes);
@@ -61,6 +97,8 @@ class CudaKernel : public OpKernel {
     provider_->AddDeferredReleaseCPUPtr(p);
   }
 
+  const cudaDeviceProp& GetDeviceProp() const { return provider_->GetDeviceProp(); };
+
   // To support cudaMemcpyAsync, the cpu memory should be allocated in pinned memory
   // and it can only be released after the copy has finished
   template <typename T>
@@ -68,24 +106,24 @@ class CudaKernel : public OpKernel {
    public:
     CudaAsyncBuffer(const CudaKernel* op_kernel) : gpu_copy_(nullptr), count_(0), op_kernel_(op_kernel) {}
 
-    CudaAsyncBuffer(const CudaKernel* op_kernel, int device_id, size_t count) : CudaAsyncBuffer(op_kernel) {
-      AllocCpuPtr(device_id, count);
+    CudaAsyncBuffer(const CudaKernel* op_kernel, size_t count) : CudaAsyncBuffer(op_kernel) {
+      AllocCpuPtr(count);
     }
 
-    CudaAsyncBuffer(const CudaKernel* op_kernel, int device_id, const T& value, size_t count)
-        : CudaAsyncBuffer(op_kernel, device_id, count) {
+    CudaAsyncBuffer(const CudaKernel* op_kernel, const T& value, size_t count)
+        : CudaAsyncBuffer(op_kernel, count) {
       T* p = CpuPtr();
       for (size_t i = 0; i != count; ++i) {
         *p++ = value;
       }
     }
 
-    CudaAsyncBuffer(const CudaKernel* op_kernel, int device_id, const std::vector<T>& vec) : CudaAsyncBuffer(op_kernel, device_id, vec.size()) {
+    CudaAsyncBuffer(const CudaKernel* op_kernel, const std::vector<T>& vec) : CudaAsyncBuffer(op_kernel, vec.size()) {
       memcpy(CpuPtr(), vec.data(), vec.size() * sizeof(T));
     }
 
-    void AllocCpuPtr(int id, size_t count) {
-      cpu_pinned_copy_ = op_kernel_->AllocateBufferOnCPUPinned<T>(id, count);
+    void AllocCpuPtr(size_t count) {
+      cpu_pinned_copy_ = op_kernel_->AllocateBufferOnCPUPinned<T>(count);
       if (cpu_pinned_copy_ == nullptr)
         throw std::runtime_error("alloc failed");
       count_ = count;
@@ -123,7 +161,6 @@ class CudaKernel : public OpKernel {
     const CudaKernel* op_kernel_;
   };
 
- protected:
   inline cublasHandle_t CublasHandle() const {
     return provider_->PerThreadCublasHandle();
   }
@@ -132,6 +169,7 @@ class CudaKernel : public OpKernel {
     return provider_->PerThreadCudnnHandle();
   }
 
+ protected:
   template <typename T>
   inline const T* GetConstOnes(size_t count) const {
     return provider_->template GetConstOnes<T>(count);
@@ -169,17 +207,43 @@ class ToCudaType<MLFloat16> {
 
 inline bool CalculateFdmStrides(gsl::span<fast_divmod> p, const std::vector<int64_t>& dims) {
   int stride = 1;
-  if (dims.empty() || p.size() < gsl::narrow_cast<ptrdiff_t>(dims.size()))
+  if (dims.empty() || p.size() < dims.size())
     return false;
-  std::ptrdiff_t rank = p.size();
-  for (std::ptrdiff_t i = 0; i < rank; i++) {
+  auto rank = p.size();
+  for (size_t i = 0; i < rank; i++) {
     p[rank - 1 - i] = fast_divmod(stride);
-    if (static_cast<size_t>(i) < dims.size() - 1) {
+    if (i < dims.size() - 1) {
       stride *= static_cast<int>(dims[dims.size() - 1 - i]);
     }
   }
   return true;
 }
+
+class CublasMathModeSetter {
+ public:
+  CublasMathModeSetter(const cudaDeviceProp& prop,cublasHandle_t handle, cublasMath_t mode) : prop_(prop), handle_(handle) {
+    cublasGetMathMode(handle, &mode_);
+#if defined(CUDA_VERSION) && CUDA_VERSION < 11000
+    if (prop.major >= 7 && mode == CUBLAS_TENSOR_OP_MATH) {
+      cublasSetMathMode(handle, mode);
+    }
+#endif
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 11000
+    if (prop.major >= 8 && mode == CUBLAS_TF32_TENSOR_OP_MATH) {
+      cublasSetMathMode(handle, mode);
+    }
+#endif
+  }
+
+  ~CublasMathModeSetter() {
+    cublasSetMathMode(handle_, mode_);
+  }
+
+ private:
+  const cudaDeviceProp& prop_;
+  cublasHandle_t handle_;
+  cublasMath_t mode_;
+};
 
 }  // namespace cuda
 }  // namespace onnxruntime

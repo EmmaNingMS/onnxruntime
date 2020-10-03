@@ -4,12 +4,14 @@
 
 # build docker image for CPU
 
-set -x
+set -x -e
 
 SOURCE_ROOT=$1
 BUILD_DIR=$2
 NUGET_REPO_DIRNAME=$3   # path relative to BUILD_DIR
-Arch=${4:-x64}          # x32, x64
+CurrentOnnxRuntimeVersion=$4
+UseCentos7=${5:-false}
+Arch=${6:-x64}          # x32, x64
 PackageName=${PACKAGENAME:-Microsoft.ML.OnnxRuntime}
 RunTestCsharp=${RunTestCsharp:-true}
 RunTestNative=${RunTestNative:-true}
@@ -19,36 +21,20 @@ IMAGE="ubuntu16.04_$Arch"
 OldDir=$(pwd)
 
 cd $SOURCE_ROOT/tools/ci_build/github/linux/docker
-if [ $Arch = "x86" ]; then
-   docker build -t "onnxruntime-$IMAGE" --build-arg OS_VERSION=16.04 --build-arg PYTHON_VERSION=${PYTHON_VER} -f Dockerfile.ubuntu_x86 .
-else
-   docker build -t "onnxruntime-$IMAGE" --build-arg OS_VERSION=16.04 --build-arg PYTHON_VERSION=${PYTHON_VER} -f Dockerfile.ubuntu .
-fi
 
-docker rm -f "onnxruntime-cpu" || true
 
-set +e
-
-docker run -h $HOSTNAME \
-        --rm \
+docker run --rm \
         --name "onnxruntime-cpu" \
         --volume "$SOURCE_ROOT:/onnxruntime_src" \
         --volume "$BUILD_DIR:/home/onnxruntimedev" \
-        --volume "$HOME/.cache/onnxruntime:/home/onnxruntimedev/.cache/onnxruntime" \
+        --volume /data/models:/home/onnxruntimedev/models:ro \
         -e "OnnxRuntimeBuildDirectory=/home/onnxruntimedev" \
         -e "IsReleaseBuild=$ISRELEASEBUILD" \
         -e "PackageName=$PackageName" \
         -e "DisableContribOps=$DISABLECONTRIBOPS" \
+        -e "DisableMlOps=$DISABLEMLOPS" \
         -e "RunTestCsharp=$RunTestCsharp" \
         -e "RunTestNative=$RunTestNative" \
-        "onnxruntime-$IMAGE" \
+        onnxruntimeregistry.azurecr.io/internal/azureml/onnxruntimecentoscpubuild:ch5g \
         /bin/bash /onnxruntime_src/csharp/test/Microsoft.ML.OnnxRuntime.EndToEndTests/runtest.sh \
-        /home/onnxruntimedev/$NUGET_REPO_DIRNAME /onnxruntime_src /home/onnxruntimedev &
-
-wait -n
-
-EXIT_CODE=$?
-
-set -e
-exit $EXIT_CODE
-cd $OldDir
+        /home/onnxruntimedev/$NUGET_REPO_DIRNAME /onnxruntime_src /home/onnxruntimedev $CurrentOnnxRuntimeVersion

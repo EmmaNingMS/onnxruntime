@@ -15,19 +15,19 @@ namespace nuphar {
 #ifdef NUPHAR_USE_MKL
 TVM_REGISTER_GLOBAL("tvm.contrib.onnxruntime.imatmul.extern.mkl")
     .set_body([](tvm::TVMArgs args, tvm::TVMRetValue* /*ret*/) {
-      DLTensor* B = args[0];
-      DLTensor* A = args[1];
+      DLTensor* A = args[0];
+      DLTensor* B = args[1];
       DLTensor* batch_seq_tensor = args[2];
       DLTensor* Y = args[3];
       int input_dim = args[4];
       int embed_dim = args[5];
 
-      DCHECK(B->strides == nullptr);
       DCHECK(A->strides == nullptr);
+      DCHECK(B->strides == nullptr);
       DCHECK(Y->strides == nullptr);
 
-      auto B_data = reinterpret_cast<int8_t*>(static_cast<char*>(B->data) + B->byte_offset);
       auto A_data = reinterpret_cast<uint8_t*>(static_cast<char*>(A->data) + A->byte_offset);
+      auto B_data = reinterpret_cast<int8_t*>(static_cast<char*>(B->data) + B->byte_offset);
       auto Y_data = reinterpret_cast<int32_t*>(static_cast<char*>(Y->data) + Y->byte_offset);
       auto batch_seq = *reinterpret_cast<int*>(static_cast<char*>(batch_seq_tensor->data) + batch_seq_tensor->byte_offset);
 
@@ -38,8 +38,8 @@ TVM_REGISTER_GLOBAL("tvm.contrib.onnxruntime.imatmul.extern.mkl")
 #ifdef NUPHAR_USE_AVX2
 TVM_REGISTER_GLOBAL("tvm.contrib.onnxruntime.imatmul.extern.avx2")
     .set_body([](tvm::TVMArgs args, tvm::TVMRetValue* /*ret*/) {
-      DLTensor* B = args[0];
-      DLTensor* A = args[1];
+      DLTensor* A = args[0];
+      DLTensor* B = args[1];
       DLTensor* batch_seq_tensor = args[2];
       DLTensor* Y = args[3];
       int input_dim = args[4];
@@ -49,8 +49,8 @@ TVM_REGISTER_GLOBAL("tvm.contrib.onnxruntime.imatmul.extern.avx2")
       DCHECK(A->strides == nullptr);
       DCHECK(Y->strides == nullptr);
 
-      auto B_data = reinterpret_cast<int8_t*>(static_cast<char*>(B->data) + B->byte_offset);
       auto A_data = reinterpret_cast<uint8_t*>(static_cast<char*>(A->data) + A->byte_offset);
+      auto B_data = reinterpret_cast<int8_t*>(static_cast<char*>(B->data) + B->byte_offset);
       auto Y_data = reinterpret_cast<int32_t*>(static_cast<char*>(Y->data) + Y->byte_offset);
       auto batch_seq = *reinterpret_cast<int*>(static_cast<char*>(batch_seq_tensor->data) + batch_seq_tensor->byte_offset);
 
@@ -76,8 +76,8 @@ TVM_REGISTER_GLOBAL("tvm.contrib.onnxruntime.imatmul.extern.avx2")
 #endif
 
 tvm::Tensor
-IMatMulExternMKL(const tvm::Tensor& B,
-                 const tvm::Tensor& A,
+IMatMulExternMKL(const tvm::Tensor& A,
+                 const tvm::Tensor& B,
                  const tvm::Array<tvm::Expr>& output_shape,
                  int input_dim,
                  int embed_dim,
@@ -91,7 +91,7 @@ IMatMulExternMKL(const tvm::Tensor& B,
   return topi::detail::make_extern(
       {output_shape}, {tvm::Int(32)},
       tvm_codegen::MakeInputsForExtern(
-          {B, A, tvm_codegen::Promote(batch_seq_dim, {16}, name + "_batch_seq")}),
+          {A, B, tvm_codegen::Promote(batch_seq_dim, {16}, name + "_batch_seq")}),
       [&](tvm::Array<tvm::Buffer> ins, tvm::Array<tvm::Buffer> outs) {
         return topi::detail::call_packed({tvm::Expr(func_str),
                                           topi::detail::pack_buffer(ins[0]),
@@ -108,8 +108,8 @@ IMatMulExternMKL(const tvm::Tensor& B,
 }
 
 tvm::Tensor
-IMatMulExternAVX2(const tvm::Tensor& B,
-                  const tvm::Tensor& A,
+IMatMulExternAVX2(const tvm::Tensor& A,
+                  const tvm::Tensor& B,
                   const tvm::Array<tvm::Expr>& output_shape,
                   int input_dim,
                   int embed_dim,
@@ -123,7 +123,7 @@ IMatMulExternAVX2(const tvm::Tensor& B,
   return topi::detail::make_extern(
       {output_shape}, {tvm::Int(32)},
       tvm_codegen::MakeInputsForExtern(
-          {B, A, tvm_codegen::Promote(batch_seq_dim, {16}, name + "_batch_seq")}),
+          {A, B, tvm_codegen::Promote(batch_seq_dim, {16}, name + "_batch_seq")}),
       [&](tvm::Array<tvm::Buffer> ins, tvm::Array<tvm::Buffer> outs) {
         return topi::detail::call_packed({tvm::Expr(func_str),
                                           topi::detail::pack_buffer(ins[0]),

@@ -6,8 +6,8 @@ import argparse
 from enum import Enum
 import numpy as np
 import onnx
-from node_factory import NodeFactory, ensure_opset
-from symbolic_shape_infer import SymbolicShapeInference, get_shape_from_type_proto
+from .node_factory import NodeFactory, ensure_opset
+from ..tools.symbolic_shape_infer import SymbolicShapeInference, get_shape_from_type_proto
 
 # trim outputs of LSTM/GRU/RNN if not used or outputed
 def trim_unused_outputs(node, graph):
@@ -271,11 +271,13 @@ def convert_lstm_to_scan(node, out_main_graph):
                                                             (c_subgraph, prev_c_subgraph)] +
                                                            ([(h_subgraph, np.zeros(shape=(), dtype=np.float32))] if node.output[0] else [])) # skip scan output if node.output[0] is empty
 
+                scan_attribs = {'body':scan_body,
+                                'scan_input_directions':[is_backward],
+                                'num_scan_inputs':1}
+                if node.output[0]:
+                    scan_attribs.update({'scan_output_directions':[is_backward]})
                 scan = nf.make_node('Scan', ([seq_len] if seq_len else []) + [init_h, init_c, X_proj],
-                                    {'body':scan_body,
-                                      'scan_input_directions':[is_backward],
-                                      'scan_output_directions':[is_backward],
-                                      'num_scan_inputs':1},
+                                    scan_attribs,
                                     output_names=[o.name for o in subgraph_outputs[(0 if seq_len else 1):]])
 
                 scan_h_outputs.append(subgraph_outputs[1])
@@ -433,11 +435,13 @@ def convert_gru_to_scan(node, out_main_graph):
                                                            [(Ht, prev_h_subgraph)] +
                                                            ([(Ht, np.zeros(shape=(), dtype=np.float32))] if node.output[0] else []))
 
+                scan_attribs = {'body':scan_body,
+                                'scan_input_directions':[is_backward],
+                                'num_scan_inputs':1}
+                if node.output[0]:
+                    scan_attribs.update({'scan_output_directions':[is_backward]})
                 scan = nf.make_node('Scan', ([seq_len] if seq_len else []) + [init_h, X_proj],
-                                    {'body':scan_body,
-                                      'scan_input_directions':[is_backward],
-                                      'scan_output_directions':[is_backward],
-                                      'num_scan_inputs':1},
+                                    scan_attribs,
                                     output_names=[o.name for o in subgraph_outputs[(0 if seq_len else 1):]])
 
                 scan_h_outputs.append(subgraph_outputs[1])
@@ -538,11 +542,13 @@ def convert_rnn_to_scan(node, out_main_graph):
                                                            [(Ht, prev_h_subgraph)] +
                                                            ([(Ht, np.zeros(shape=(), dtype=np.float32))] if node.output[0] else []))
 
+                scan_attribs = {'body':scan_body,
+                                'scan_input_directions':[is_backward],
+                                'num_scan_inputs':1}
+                if node.output[0]:
+                    scan_attribs.update({'scan_output_directions':[is_backward]})
                 scan = nf.make_node('Scan', ([seq_len] if seq_len else []) + [init_h, X_proj],
-                                    {'body':scan_body,
-                                      'scan_input_directions':[is_backward],
-                                      'scan_output_directions':[is_backward],
-                                      'num_scan_inputs':1},
+                                    scan_attribs,
                                     output_names=[o.name for o in subgraph_outputs[(0 if seq_len else 1):]])
 
                 scan_h_outputs.append(subgraph_outputs[1])
@@ -584,6 +590,99 @@ def convert_to_scan_model(input_model, output_model):
 
     onnx.save(out_mp, output_model)
 
+def gemm_to_matmul(node, nf, converted_initializers):
+    assert node.op_type == 'Gemm'
+
+    alpha = NodeFactory.get_attribute(node, 'alpha', 1.0)
+    beta = NodeFactory.get_attribute(node, 'beta', 1.0)
+    transA = NodeFactory.get_attribute(node, 'transA', 0)
+    transB = NodeFactory.get_attribute(node, 'transB', 0)
+
+    A = node.input[0]
+    B = node.input[1]
+    Y = node.output[0]
+
+    with nf.scoped_prefix(node.name) as scoped_prefix:
+        if alpha != 1.0:
+            alpha_name = node.name + '_Const_alpha'
+            nf.make_initializer(np.full((), alpha, dtype=np.float32), alpha_name)
+            alpha_A = nf.make_node('Mul', [alpha_name, A])
+            A = alpha_A.name
+
+        if transA:
+            if A in converted_initializers:
+                A = converted_initializers[A]
+            else:
+                A_initializer = nf.get_initializer(A)
+                # A is an initializer
+                if A_initializer is not None:
+                    new_A = A + '_trans'
+                    converted_initializers[A] = new_A
+                    nf.make_initializer(np.transpose(A_initializer), new_A, in_main_graph=True)
+                    nf.remove_initializer(A)
+                    A = new_A
+                else:
+                    A = nf.make_node('Transpose', A)
+        if transB:
+            if B in converted_initializers:
+                B = converted_initializers[B]
+            else:
+                B_initializer = nf.get_initializer(B)
+                # B is an initializer
+                if B_initializer is not None:
+                    new_B = B + '_trans'
+                    converted_initializers[B] = new_B
+                    nf.make_initializer(np.transpose(B_initializer), new_B, in_main_graph=True)
+                    nf.remove_initializer(B)
+                    B = new_B
+                else:
+                    B = nf.make_node('Transpose', B)
+
+        if len(node.input) != 3 or beta == 0.0:
+            nf.make_node('MatMul', [A, B], output_names=Y)
+        else:
+            AB = nf.make_node('MatMul', [A, B])
+            C = node.input[2]
+            if beta != 1.0:
+                beta_name = node.name + '_Const_beta'
+                nf.make_initializer(np.full((), beta, dtype=np.float32), beta_name)
+                C = nf.make_node('Mul', [beta_name, C])
+            nf.make_node('Add', [AB, C], output_names=Y)
+
+def convert_gemm_to_matmul(input_model, output_model):
+    in_mp = onnx.load(input_model)
+    out_mp = onnx.ModelProto()
+    out_mp.CopyFrom(in_mp)
+    out_mp.ir_version = 5 # update ir version to avoid requirement of initializer in graph input
+    out_mp.graph.ClearField('node')
+    nf = NodeFactory(out_mp.graph)
+    # gemm_to_matmul will generate transposed weights if the corresponding input
+    # comes from initializer. We keep a map between the original and converted
+    # ones in case the original initializer is shared between Gemm ops
+    converted_initializers = {}
+
+    for in_n in in_mp.graph.node:
+        if in_n.op_type == 'Gemm':
+            gemm_to_matmul(in_n, nf, converted_initializers)
+            continue
+
+        out_n = out_mp.graph.node.add()
+        out_n.CopyFrom(in_n)
+        if in_n.op_type == 'Scan' or in_n.op_type == 'Loop':
+            in_subgraph = NodeFactory.get_attribute(in_n, 'body')
+            out_subgraph = NodeFactory.get_attribute(out_n, 'body')
+            out_subgraph.ClearField('node')
+            scan_nf = NodeFactory(out_mp.graph, out_subgraph)
+
+            for in_sn in in_subgraph.node:
+                if in_sn.op_type == 'Gemm':
+                    gemm_to_matmul(in_sn, scan_nf, converted_initializers)
+                    continue
+                out_sn = out_subgraph.node.add()
+                out_sn.CopyFrom(in_sn)
+
+    onnx.save(out_mp, output_model)
+
 # Old models (ir_version < 4) is required to initializers in graph inputs
 # This is optional for ir_version >= 4
 def remove_initializers_from_inputs(input_model, output_model, remain_inputs=[]):
@@ -603,10 +702,111 @@ def remove_initializers_from_inputs(input_model, output_model, remain_inputs=[])
     mp.graph.input.extend(new_inputs)
     onnx.save(mp, output_model)
 
+def optimize_input_projection(input_model, output_model):
+    in_mp = onnx.load(input_model)
+    out_mp = onnx.ModelProto()
+    out_mp.CopyFrom(in_mp)
+    out_mp.ir_version = 5 # update ir version to avoid requirement of initializer in graph input
+    out_mp.graph.ClearField('node')
+    nf = NodeFactory(out_mp.graph, prefix='opt_inproj_')
+    initializers = dict([(i.name, i) for i in in_mp.graph.initializer])
+    # first find possible fused SVD and do constant folding on MatMul of initializers
+    const_matmuls = [n for n in in_mp.graph.node if n.op_type == 'MatMul' and all([i in initializers for i in n.input])]
+    for mm in const_matmuls:
+        lhs = numpy_helper.to_array(initializers[mm.input[0]])
+        rhs = numpy_helper.to_array(initializers[mm.input[1]])
+        val = np.matmul(lhs, rhs)
+        new_initializer = out_mp.graph.initializer.add()
+        new_initializer.CopyFrom(numpy_helper.from_array(val, mm.output[0]))
+        if not [n for n in in_mp.graph.node if n != mm and mm.input[0] in n.input]:
+            nf.remove_initializer(mm.input[0])
+        if not [n for n in in_mp.graph.node if n != mm and mm.input[1] in n.input]:
+            nf.remove_initializer(mm.input[1])
+
+    initializers = dict([(i.name,i) for i in out_mp.graph.initializer])
+
+    # remove const_matmul output from graph outputs
+    new_outputs = [i for i in out_mp.graph.output if not [m for m in const_matmuls if m.output[0] == i.name]]
+    out_mp.graph.ClearField('output')
+    out_mp.graph.output.extend(new_outputs)
+
+    for in_n in in_mp.graph.node:
+        if in_n in const_matmuls:
+            continue
+
+        optimize_scan = False
+        if in_n.op_type == 'Scan':
+            in_sg = NodeFactory.get_attribute(in_n, 'body')
+            num_scan_inputs = NodeFactory.get_attribute(in_n, 'num_scan_inputs')
+            # only support 1 scan input
+            if num_scan_inputs == 1:
+                optimize_scan = True
+
+        # copy the node if it's not the scan node that is supported at the moment
+        if not optimize_scan:
+            out_n = out_mp.graph.node.add()
+            out_n.CopyFrom(in_n)
+            continue
+
+        scan_input_directions = NodeFactory.get_attribute(in_n, 'scan_input_directions')
+        scan_output_directions = NodeFactory.get_attribute(in_n, 'scan_output_directions')
+        out_sg = onnx.GraphProto()
+        out_sg.CopyFrom(in_sg)
+        out_sg.ClearField('node')
+        nf_subgraph = NodeFactory(out_mp.graph, out_sg, prefix='opt_inproj_sg_' + in_n.name + '_')
+        new_inputs = list(in_n.input)
+        in_sg_inputs = [i.name for i in in_sg.input]
+        replaced_matmul = None
+        for in_sn in in_sg.node:
+            if in_sn.op_type == 'Concat' and len(in_sn.input) == 2 and all([i in in_sg_inputs for i in in_sn.input]):
+                # make sure the concat's inputs are scan input and scan state
+                if NodeFactory.get_attribute(in_sn, 'axis') != len(in_sg.input[-1].type.tensor_type.shape.dim) - 1:
+                    continue # must concat last dim
+                matmul_node = [nn for nn in in_sg.node if nn.op_type == 'MatMul' and in_sn.output[0] in nn.input]
+                if not matmul_node:
+                    continue
+                replaced_matmul = matmul_node[0]
+                assert replaced_matmul.input[1] in initializers
+                aa = nf.get_initializer(replaced_matmul.input[1])
+                input_size = in_sg.input[-1].type.tensor_type.shape.dim[-1].dim_value
+                if in_sg_inputs[-1] == in_sn.input[0]:
+                    hidden_idx = 1
+                    input_proj_weights, hidden_proj_weights = np.vsplit(aa, [input_size])
+                else:
+                    hidden_idx = 0
+                    hidden_proj_weights, input_proj_weights = np.vsplit(aa, [aa.shape[-1] - input_size])
+                # add matmul for input_proj outside of Scan
+                input_proj = nf.make_node('MatMul', [new_inputs[-1], input_proj_weights])
+                input_proj.doc_string = replaced_matmul.doc_string
+                new_inputs[-1] = input_proj.name
+                out_sg.input[-1].type.tensor_type.shape.dim[-1].dim_value = input_proj_weights.shape[-1]
+                # add matmul for hidden_proj inside Scan
+                hidden_proj = nf_subgraph.make_node('MatMul', [in_sn.input[hidden_idx], hidden_proj_weights])
+                hidden_proj.doc_string = replaced_matmul.doc_string
+                nf_subgraph.make_node('Add', [out_sg.input[-1].name, hidden_proj], output_names=replaced_matmul.output[0])
+                # remove initializer of concat matmul
+                if not [n for n in in_mp.graph.node if n != in_n and replaced_matmul.input[1] in n.input]:
+                    nf.remove_initializer(replaced_matmul.input[1])
+            elif in_sn != replaced_matmul:
+                out_sg.node.add().CopyFrom(in_sn)
+
+        scan = nf.make_node('Scan', new_inputs,
+                            {'body':out_sg,
+                              'scan_input_directions':scan_input_directions,
+                              'scan_output_directions':scan_output_directions,
+                              'num_scan_inputs':num_scan_inputs},
+                            output_names=list(in_n.output))
+        scan.name = in_n.name
+        scan.doc_string = in_n.doc_string
+
+    onnx.save(out_mp, output_model)
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', help='The modification mode',
                         choices=['to_scan',
+                                 'opt_inproj',
+                                 'gemm_to_matmul',
                                  'remove_initializers_from_inputs'])
     parser.add_argument('--input', help='The input model file', default=None)
     parser.add_argument('--output', help='The output model file', default=None)
@@ -617,13 +817,21 @@ if __name__ == '__main__':
     print('input model: ' + args.input)
     print('output model ' + args.output)
     if args.mode == 'to_scan':
-        print('Convert LSTM to Scan...')
+        print('Convert LSTM/GRU/RNN to Scan...')
         convert_to_scan_model(args.input, args.output)
+    elif args.mode == 'gemm_to_matmul':
+        print('Convert Gemm to MatMul')
+        convert_gemm_to_matmul(args.input, args.output)
+    elif args.mode == 'opt_inproj':
+        print('Optimize input projection in Scan...')
+        optimize_input_projection(args.input, args.output)
     elif args.mode == 'remove_initializers_from_inputs':
         print('Remove all initializers from input for model with IR version >= 4...')
         remove_initializers_from_inputs(args.input, args.output)
     else:
         raise NotImplementedError('Unknown mode')
     print('Running symbolic shape inference on output model')
-    SymbolicShapeInference.infer_shapes(args.output, args.output)
+    mp = onnx.load(args.output)
+    mp = SymbolicShapeInference.infer_shapes(mp, auto_merge=True)
+    onnx.save(mp, args.output)
     print('Done!')

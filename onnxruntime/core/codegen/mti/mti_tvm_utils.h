@@ -51,7 +51,7 @@ tvm::Tensor Promote(const tvm::Expr& expr,
 
 tvm::Tensor MakeZeroTensor(const tvm::Array<tvm::Expr>& shape, HalideIR::Type type, const std::string& name);
 
-void DumpTVMModuleToFile(const std::string& filename_prefix, tvm::runtime::Module& module);
+void DumpTVMModuleToFile(const std::string& filename, tvm::runtime::Module& module);
 
 bool BroadcastDim(const tvm::Array<tvm::Expr>& shape, size_t i, size_t output_rank, tvm::Expr& dim);
 
@@ -59,6 +59,9 @@ inline int64_t HandleNegativeAxis(int64_t axis, int64_t rank) {
   MTI_ASSERT(axis >= -rank && axis <= rank - 1);
   return axis = axis < 0 ? (axis + rank) : axis;
 }
+
+// Make sure idx is clamped in the range of [-bound, bound - 1]
+tvm::Expr ClampIndex(const tvm::Expr& idx, const tvm::Expr& bound);
 
 // Helper function to workaround tvm ExternOp issue when input has symbolic dimensions
 tvm::Array<tvm::Tensor> MakeInputsForExtern(const tvm::Array<tvm::Tensor>& inputs, const std::string& name = "make_inputs_for_extern");

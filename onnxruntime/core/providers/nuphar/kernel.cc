@@ -4,6 +4,7 @@
 #include "core/providers/nuphar/kernel.h"
 
 #include "core/codegen/passes/utils/codegen_context.h"
+#include "core/codegen/common/profile.h"
 #include "core/framework/tensorprotoutils.h"
 #include "core/providers/nuphar/common/analysis/subgraph_codegen_stats.h"
 #include "core/providers/nuphar/compiler/initializer_info.h"
@@ -23,7 +24,7 @@ NupharKernelState::NupharKernelState(
     const NupharExecutionProvider& provider)
     : provider_(provider),
       ctx_(ctx) {
-  partition_info_ = std::make_unique<OrtSubgraphAllocationInfo>(node);
+  partition_info_ = onnxruntime::make_unique<OrtSubgraphAllocationInfo>(node);
 
   std::vector<NupharSubgraphUnit> subgraphs;
 
@@ -51,13 +52,13 @@ void NupharKernelState::Compile(const NupharSubgraphUnit& subgraph) {
   auto tvm_target = provider_.GetTVMTarget();
 
   NupharCompiler tvm_compiler(subgraph,
-                              generated_initailizers_,
+                              generated_initializers_,
                               provider_.GetNupharCodeGenHandle());
 
   codegen_status_ = tvm_compiler.Build(subgraph);
 
   if (codegen_status_.IsOK()) {
-    func_infos_.emplace_back(std::make_unique<NupharFuncInfo>());
+    func_infos_.emplace_back(onnxruntime::make_unique<NupharFuncInfo>());
     codegen_status_ = tvm_compiler.Lower(subgraph,
                                          tvm_target,
                                          provider_.GetTVMHostTarget(),
@@ -93,7 +94,7 @@ Status NupharKernelState::Compute(OpKernelContext* op_kernel_context) const {
 
   // Create the unordered_map if it not exist
   if (nullptr == nuphar_compute_ctx_map_) {
-    nuphar_compute_ctx_map_ = std::make_unique<NupharFuncStateToComputeCtxMap>();
+    nuphar_compute_ctx_map_ = onnxruntime::make_unique<NupharFuncStateToComputeCtxMap>();
   }
 
   // Create KernelComputeCtx if it not exist
@@ -103,7 +104,7 @@ Status NupharKernelState::Compute(OpKernelContext* op_kernel_context) const {
 
     nuphar_compute_ctx_map_->emplace(
         std::make_pair(this,
-                       std::make_unique<KernelComputeCtx>(
+                       onnxruntime::make_unique<KernelComputeCtx>(
                            provider_.GetNupharRuntimeHandle(),
                            provider_.GetTLSRealizedDims(),
                            data_alloc_func,
@@ -117,6 +118,7 @@ Status NupharKernelState::Compute(OpKernelContext* op_kernel_context) const {
   compute_ctx->Bind(op_kernel_context);
 
   for (auto* call : exec_block_calls_) {
+    CODEGEN_PROFILER_EVENT(call->Name());
     call->Run(compute_ctx);
   }
 
@@ -178,14 +180,37 @@ ONNX_OPERATOR_KERNEL_EX(
     9,
     kNupharExecutionProvider,
     KernelDefBuilder()
-        .TypeConstraint("T1", DataTypeImpl::AllFixedSizeTensorTypes())
+        .TypeConstraint("T1", DataTypeImpl::AllFixedSizeTensorExceptHalfTypes())
         .TypeConstraint("T2", DataTypeImpl::AllFixedSizeTensorExceptHalfTypes()),
+    nuphar::NupharKernel);
+
+ONNX_OPERATOR_VERSIONED_KERNEL_EX(
+    Gather,
+    kOnnxDomain,
+    1,
+    10,
+    kNupharExecutionProvider,
+    KernelDefBuilder()
+        .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes())
+        .TypeConstraint("Tind", std::vector<MLDataType>{DataTypeImpl::GetTensorType<int32_t>(),
+                                                        DataTypeImpl::GetTensorType<int64_t>()}),
     nuphar::NupharKernel);
 
 ONNX_OPERATOR_KERNEL_EX(
     Gather,
     kOnnxDomain,
-    1,
+    11,
+    kNupharExecutionProvider,
+    KernelDefBuilder()
+        .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes())
+        .TypeConstraint("Tind", std::vector<MLDataType>{DataTypeImpl::GetTensorType<int32_t>(),
+                                                        DataTypeImpl::GetTensorType<int64_t>()}),
+    nuphar::NupharKernel);
+
+ONNX_OPERATOR_KERNEL_EX(
+    GatherElements,
+    kOnnxDomain,
+    11,
     kNupharExecutionProvider,
     KernelDefBuilder()
         .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes())
@@ -217,14 +242,59 @@ ONNX_OPERATOR_KERNEL_EX(
         .TypeConstraint("T3", DataTypeImpl::GetTensorType<int32_t>()),
     nuphar::NupharKernel);
 
-ONNX_OPERATOR_KERNEL_EX(
+ONNX_OPERATOR_VERSIONED_KERNEL_EX(
     Scan,
     kOnnxDomain,
     9,
+    10,
     kNupharExecutionProvider,
     KernelDefBuilder()
         .TypeConstraint("I", DataTypeImpl::GetTensorType<int64_t>())
         .TypeConstraint("V", DataTypeImpl::AllTensorTypes()),
+    nuphar::NupharKernel);
+
+ONNX_OPERATOR_KERNEL_EX(
+    Scan,
+    kOnnxDomain,
+    11,
+    kNupharExecutionProvider,
+    KernelDefBuilder()
+        .TypeConstraint("I", DataTypeImpl::GetTensorType<int64_t>())
+        .TypeConstraint("V", DataTypeImpl::AllTensorTypes()),
+    nuphar::NupharKernel);
+
+ONNX_OPERATOR_VERSIONED_KERNEL_EX(
+    Scatter,
+    kOnnxDomain,
+    9,
+    10,
+    kNupharExecutionProvider,
+    KernelDefBuilder()
+        .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes())
+        .TypeConstraint("Tind", std::vector<MLDataType>{DataTypeImpl::GetTensorType<int32_t>(),
+                                                        DataTypeImpl::GetTensorType<int64_t>()}),
+    nuphar::NupharKernel);
+
+ONNX_OPERATOR_KERNEL_EX(
+    Scatter,
+    kOnnxDomain,
+    11,
+    kNupharExecutionProvider,
+    KernelDefBuilder()
+        .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes())
+        .TypeConstraint("Tind", std::vector<MLDataType>{DataTypeImpl::GetTensorType<int32_t>(),
+                                                        DataTypeImpl::GetTensorType<int64_t>()}),
+    nuphar::NupharKernel);
+
+ONNX_OPERATOR_KERNEL_EX(
+    ScatterElements,
+    kOnnxDomain,
+    11,
+    kNupharExecutionProvider,
+    KernelDefBuilder()
+        .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes())
+        .TypeConstraint("Tind", std::vector<MLDataType>{DataTypeImpl::GetTensorType<int32_t>(),
+                                                        DataTypeImpl::GetTensorType<int64_t>()}),
     nuphar::NupharKernel);
 
 }  // namespace onnxruntime

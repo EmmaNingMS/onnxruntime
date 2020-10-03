@@ -3,11 +3,11 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#if !defined(ORT_MINIMAL_BUILD)
+
 #include "core/framework/data_types.h"
 #include "core/framework/tensor_shape.h"
 #include "core/framework/tensor.h"
-
-using namespace onnxruntime::common;
 
 namespace onnxruntime {
 
@@ -26,7 +26,7 @@ class SparseTensor final {
                size_t nnz,
                void* values_data,
                void* indices_data,
-               const OrtMemoryInfo& allocator_info);
+               const OrtMemoryInfo& memory_info);
 
   SparseTensor(MLDataType elt_type,
                const TensorShape& shape,
@@ -39,7 +39,7 @@ class SparseTensor final {
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(SparseTensor);
 
   // Returns the number of entries in the values tensor (aka "NNZ" or "number of nonzero values")
-  size_t NumValues() const { return values_.Shape().Size(); }
+  size_t NumValues() const { return static_cast<size_t>(values_.Shape().Size()); }
 
   const Tensor& Values() const {
     return values_;
@@ -72,3 +72,5 @@ class SparseTensor final {
 };
 
 }  // namespace onnxruntime
+
+#endif

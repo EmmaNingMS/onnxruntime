@@ -7,49 +7,92 @@ from setuptools import setup, find_packages, Extension
 from distutils import log as logger
 from distutils.command.build_ext import build_ext as _build_ext
 from glob import glob
-from os import path, getcwd, environ, remove
-from shutil import copyfile
+from os import path, getcwd, environ, remove, walk, makedirs, listdir
+from shutil import copyfile, copytree, rmtree
 import platform
 import subprocess
 import sys
 import datetime
 
 nightly_build = False
+featurizers_build = False
 package_name = 'onnxruntime'
+wheel_name_suffix = None
 
-if '--use_tensorrt' in sys.argv:
-    package_name = 'onnxruntime-gpu-tensorrt'
-    sys.argv.remove('--use_tensorrt')
-    if '--nightly_build' in sys.argv:
-        package_name = 'ort-trt-nightly'
-        nightly_build = True
-        sys.argv.remove('--nightly_build')
-elif '--use_cuda' in sys.argv:
-    package_name = 'onnxruntime-gpu'
-    sys.argv.remove('--use_cuda')
-    if '--nightly_build' in sys.argv:
-        package_name = 'ort-gpu-nightly'
-        nightly_build = True
-        sys.argv.remove('--nightly_build')
-elif '--use_ngraph' in sys.argv:
-    package_name = 'onnxruntime-ngraph'
-    sys.argv.remove('--use_ngraph')
-
-elif '--use_openvino' in sys.argv:
-    package_name = 'onnxruntime-openvino'
-
-elif '--use_nuphar' in sys.argv:
-    package_name = 'onnxruntime-nuphar'
-    sys.argv.remove('--use_nuphar')
+# Any combination of the following arguments can be applied
+if '--use_featurizers' in sys.argv:
+    featurizers_build = True
+    sys.argv.remove('--use_featurizers')
 
 if '--nightly_build' in sys.argv:
     package_name = 'ort-nightly'
     nightly_build = True
     sys.argv.remove('--nightly_build')
 
-is_manylinux2010 = False
-if environ.get('AUDITWHEEL_PLAT', None) == 'manylinux2010_x86_64':
-    is_manylinux2010 = True
+for arg in sys.argv[1:]:
+    if arg.startswith("--wheel_name_suffix="):
+        wheel_name_suffix = arg[len("--wheel_name_suffix="):]
+
+        sys.argv.remove(arg)
+
+        break
+
+# The following arguments are mutually exclusive
+if '--use_tensorrt' in sys.argv:
+    package_name = 'onnxruntime-gpu-tensorrt' if not nightly_build else 'ort-trt-nightly'
+    sys.argv.remove('--use_tensorrt')
+elif '--use_cuda' in sys.argv:
+    package_name = 'onnxruntime-gpu' if not nightly_build else 'ort-gpu-nightly'
+    sys.argv.remove('--use_cuda')
+elif '--use_ngraph' in sys.argv:
+    package_name = 'onnxruntime-ngraph'
+    sys.argv.remove('--use_ngraph')
+elif '--use_openvino' in sys.argv:
+    package_name = 'onnxruntime-openvino'
+    sys.argv.remove('--use_openvino')
+elif '--use_dnnl' in sys.argv:
+    package_name = 'onnxruntime-dnnl'
+    sys.argv.remove('--use_dnnl')
+elif '--use_nuphar' in sys.argv:
+    package_name = 'onnxruntime-nuphar'
+    sys.argv.remove('--use_nuphar')
+elif '--use_vitisai' in sys.argv:
+    package_name = 'onnxruntime-vitisai'
+    sys.argv.remove('--use_vitisai')
+elif '--use_acl' in sys.argv:
+    package_name = 'onnxruntime-acl'
+    sys.argv.remove('--use_acl')
+elif '--use_armnn' in sys.argv:
+    package_name = 'onnxruntime-armnn'
+    sys.argv.remove('--use_armnn')
+elif '--use_dml' in sys.argv:
+    package_name = 'onnxruntime-dml'
+    sys.argv.remove('--use_dml')
+
+# PEP 513 defined manylinux1_x86_64 and manylinux1_i686
+# PEP 571 defined manylinux2010_x86_64 and manylinux2010_i686
+# PEP 599 defines the following platform tags:
+# manylinux2014_x86_64
+# manylinux2014_i686
+# manylinux2014_aarch64
+# manylinux2014_armv7l
+# manylinux2014_ppc64
+# manylinux2014_ppc64le
+# manylinux2014_s390x
+manylinux_tags = [
+    'manylinux1_x86_64',
+    'manylinux1_i686',
+    'manylinux2010_x86_64',
+    'manylinux2010_i686',
+    'manylinux2014_x86_64',
+    'manylinux2014_i686',
+    'manylinux2014_aarch64',
+    'manylinux2014_armv7l',
+    'manylinux2014_ppc64',
+    'manylinux2014_ppc64le',
+    'manylinux2014_s390x',
+]
+is_manylinux = environ.get('AUDITWHEEL_PLAT', None) in manylinux_tags
 
 
 class build_ext(_build_ext):
@@ -64,7 +107,7 @@ try:
     class bdist_wheel(_bdist_wheel):
         def finalize_options(self):
             _bdist_wheel.finalize_options(self)
-            if not is_manylinux2010:
+            if not is_manylinux:
                 self.root_is_pure = False
 
         def _rewrite_ld_preload(self, to_preload):
@@ -82,13 +125,13 @@ try:
                         f.write('_{} = CDLL("{}", mode=RTLD_GLOBAL)\n'.format(library.split('.')[0], library))
 
         def run(self):
-            if is_manylinux2010:
+            if is_manylinux:
                 source = 'onnxruntime/capi/onnxruntime_pybind11_state.so'
-                dest = 'onnxruntime/capi/onnxruntime_pybind11_state_manylinux2010.so'
+                dest = 'onnxruntime/capi/onnxruntime_pybind11_state_manylinux1.so'
                 logger.info('copying %s -> %s', source, dest)
                 copyfile(source, dest)
                 result = subprocess.run(['patchelf', '--print-needed', dest], check=True, stdout=subprocess.PIPE, universal_newlines=True)
-                cuda_dependencies = ['libcublas.so', 'libcudnn.so', 'libcudart.so']
+                cuda_dependencies = ['libcublas.so', 'libcudnn.so', 'libcudart.so', 'libcurand.so', 'libcufft.so', 'libnvToolsExt.so']
                 to_preload = []
                 args = ['patchelf', '--debug']
                 for line in result.stdout.split('\n'):
@@ -101,58 +144,78 @@ try:
                     subprocess.run(args, check=True, stdout=subprocess.PIPE)
                 self._rewrite_ld_preload(to_preload)
             _bdist_wheel.run(self)
-            if is_manylinux2010:
+            if is_manylinux:
                 file = glob(path.join(self.dist_dir, '*linux*.whl'))[0]
-                logger.info('repairing %s for manylinux2010', file)
+                logger.info('repairing %s for manylinux1', file)
                 try:
-                    subprocess.run(['auditwheel', 'repair', '--plat', 'manylinux2010_x86_64', '-w', self.dist_dir, file], check=True, stdout=subprocess.PIPE)
+                    subprocess.run(['auditwheel', 'repair', '-w', self.dist_dir, file], check=True, stdout=subprocess.PIPE)
                 finally:
                     logger.info('removing %s', file)
                     remove(file)
 
-except ImportError:
+except ImportError as error:
+    print("Error importing dependencies:")
+    print(error)
     bdist_wheel = None
 
 # Additional binaries
 if platform.system() == 'Linux':
-  libs = ['onnxruntime_pybind11_state.so', 'libmkldnn.so.0', 'libmklml_intel.so', 'libiomp5.so']
+  libs = ['onnxruntime_pybind11_state.so', 'libdnnl.so.1', 'libmklml_intel.so', 'libmklml_gnu.so', 'libiomp5.so', 'mimalloc.so']
+  # DNNL & TensorRT EPs are built as shared libs
+  libs.extend(['libonnxruntime_providers_shared.so'])
+  libs.extend(['libonnxruntime_providers_dnnl.so'])
+  libs.extend(['libonnxruntime_providers_tensorrt.so'])
   # nGraph Libs
   libs.extend(['libngraph.so', 'libcodegen.so', 'libcpu_backend.so', 'libmkldnn.so', 'libtbb_debug.so', 'libtbb_debug.so.2', 'libtbb.so', 'libtbb.so.2'])
+  # OpenVINO Libs
+  if package_name == 'onnxruntime-openvino':
+    if platform.system() == 'Linux':
+      libs.extend(['libovep_ngraph.so'])
   # Nuphar Libs
-  libs.extend(['libtvm.so'])
+  libs.extend(['libtvm.so.0.5.1'])
+  if nightly_build:
+    libs.extend(['libonnxruntime_pywrapper.so'])
 elif platform.system() == "Darwin":
-  libs = ['onnxruntime_pybind11_state.so', 'libmkldnn.0.dylib'] # TODO add libmklml and libiomp5 later.
+  libs = ['onnxruntime_pybind11_state.so', 'libdnnl.1.dylib', 'mimalloc.so'] # TODO add libmklml and libiomp5 later.
+  # DNNL & TensorRT EPs are built as shared libs
+  libs.extend(['libonnxruntime_providers_shared.dylib'])
+  libs.extend(['libonnxruntime_providers_dnnl.dylib'])
+  libs.extend(['libonnxruntime_providers_tensorrt.dylib'])
+  if nightly_build:
+    libs.extend(['libonnxruntime_pywrapper.dylib'])
 else:
-  libs = ['onnxruntime_pybind11_state.pyd', 'mkldnn.dll', 'mklml.dll', 'libiomp5md.dll']
-  libs.extend(['ngraph.dll', 'cpu_backend.dll', 'tbb.dll'])
+  libs = ['onnxruntime_pybind11_state.pyd', 'dnnl.dll', 'mklml.dll', 'libiomp5md.dll']
+  # DNNL & TensorRT EPs are built as shared libs
+  libs.extend(['onnxruntime_providers_shared.dll'])
+  libs.extend(['onnxruntime_providers_dnnl.dll'])
+  libs.extend(['onnxruntime_providers_tensorrt.dll'])
+  # nGraph Libs
+  libs.extend(['ngraph.dll', 'cpu_backend.dll', 'tbb.dll', 'mimalloc-override.dll', 'mimalloc-redirect.dll', 'mimalloc-redirect32.dll'])
+  # DirectML Libs
+  libs.extend(['directml.dll'])
   # Nuphar Libs
   libs.extend(['tvm.dll'])
+  if nightly_build:
+    libs.extend(['onnxruntime_pywrapper.dll'])
 
-if is_manylinux2010:
-    data = []
+if is_manylinux:
+    data = ['capi/libonnxruntime_pywrapper.so'] if nightly_build else []
     ext_modules = [
         Extension(
             'onnxruntime.capi.onnxruntime_pybind11_state',
-            ['onnxruntime/capi/onnxruntime_pybind11_state_manylinux2010.so'],
+            ['onnxruntime/capi/onnxruntime_pybind11_state_manylinux1.so'],
         ),
     ]
 else:
     data = [path.join('capi', x) for x in libs if path.isfile(path.join('onnxruntime', 'capi', x))]
     ext_modules = []
 
-
-python_modules_list = list()
-if '--use_openvino' in sys.argv:
-  #Adding python modules required for openvino ep
-  python_modules_list.extend(['openvino_mo', 'openvino_emitter'])
-  sys.argv.remove('--use_openvino')
-
 # Additional examples
 examples_names = ["mul_1.onnx", "logreg_iris.onnx", "sigmoid.onnx"]
 examples = [path.join('datasets', x) for x in examples_names]
 
 # Extra files such as EULA and ThirdPartyNotices
-extra = ["LICENSE", "ThirdPartyNotices.txt"]
+extra = ["LICENSE", "ThirdPartyNotices.txt", "Privacy.md"]
 
 # Description
 README = path.join(getcwd(), "docs/python/README.rst")
@@ -164,13 +227,104 @@ if not path.exists(README):
 with open(README) as f:
     long_description = f.read()
 
+packages = [
+    'onnxruntime',
+    'onnxruntime.backend',
+    'onnxruntime.capi',
+    'onnxruntime.capi.training',
+    'onnxruntime.datasets',
+    'onnxruntime.tools',
+    'onnxruntime.quantization',
+    'onnxruntime.quantization.operators',
+    'onnxruntime.transformers',
+]
+
+if '--enable_training' in sys.argv:
+    packages.extend(['onnxruntime.training',
+                     'onnxruntime.training.amp',
+                     'onnxruntime.training.optim'])
+    sys.argv.remove('--enable_training')
+
+package_data = {}
+data_files = []
+
+if package_name == 'onnxruntime-nuphar':
+    packages += ["onnxruntime.nuphar"]
+    extra += [path.join('nuphar', 'NUPHAR_CACHE_VERSION')]
+
+if featurizers_build:
+    # Copy the featurizer data from its current directory into the onnx runtime directory so that the
+    # content can be included as module data.
+
+    # Apparently, the root_dir is different based on how the script is invoked
+    source_root_dir = None
+    dest_root_dir = None
+
+    for potential_source_prefix, potential_dest_prefix in [
+        (getcwd(), getcwd()),
+        (path.dirname(__file__), path.dirname(__file__)),
+        (path.join(getcwd(), ".."), getcwd()),
+    ]:
+        potential_dir = path.join(potential_source_prefix, "external", "FeaturizersLibrary", "Data")
+        if path.isdir(potential_dir):
+            source_root_dir = potential_source_prefix
+            dest_root_dir = potential_dest_prefix
+
+            break
+
+    if source_root_dir is None:
+        raise Exception("Unable to find the build root dir")
+
+    assert dest_root_dir is not None
+
+    featurizer_source_dir = path.join(source_root_dir, "external", "FeaturizersLibrary", "Data")
+    assert path.isdir(featurizer_source_dir), featurizer_source_dir
+
+    featurizer_dest_dir = path.join(dest_root_dir, "onnxruntime", "FeaturizersLibrary", "Data")
+    if path.isdir(featurizer_dest_dir):
+        rmtree(featurizer_dest_dir)
+
+    for item in listdir(featurizer_source_dir):
+        this_featurizer_source_fullpath = path.join(featurizer_source_dir)
+        assert path.isdir(this_featurizer_source_fullpath), this_featurizer_source_fullpath
+
+        copytree(this_featurizer_source_fullpath, featurizer_dest_dir)
+
+        packages.append("onnxruntime.FeaturizersLibrary.Data.{}".format(item))
+        package_data[packages[-1]] = listdir(path.join(featurizer_dest_dir, item))
+
+package_data["onnxruntime"] = data + examples + extra
 
 version_number = ''
 with open('VERSION_NUMBER') as f:
     version_number = f.readline().strip()
 if nightly_build:
-    date_suffix = str(datetime.datetime.now().date().strftime("%m%d"))
-    version_number = version_number + ".dev" + date_suffix
+    #https://docs.microsoft.com/en-us/azure/devops/pipelines/build/variables
+    build_suffix = environ.get('BUILD_BUILDNUMBER')
+    if build_suffix is None:
+      #The following line is only for local testing
+      build_suffix = str(datetime.datetime.now().date().strftime("%Y%m%d"))
+    else:
+      build_suffix = build_suffix.replace('.','')
+
+    version_number = version_number + ".dev" + build_suffix
+
+if wheel_name_suffix:
+    package_name = "{}_{}".format(package_name, wheel_name_suffix)
+
+cmd_classes = {}
+if bdist_wheel is not None :
+    cmd_classes['bdist_wheel'] = bdist_wheel
+cmd_classes['build_ext'] = build_ext
+
+requirements_path = path.join(getcwd(), "requirements.txt")
+if not path.exists(requirements_path):
+    this = path.dirname(__file__)
+    requirements_path = path.join(this, "requirements.txt")
+if not path.exists(requirements_path):
+    raise FileNotFoundError("Unable to find 'requirements.txt'")
+with open(requirements_path) as f:
+    install_requires = f.read().splitlines()
 
 # Setup
 setup(
@@ -180,33 +334,26 @@ setup(
     long_description=long_description,
     author='Microsoft Corporation',
     author_email='onnx@microsoft.com',
-    cmdclass={'bdist_wheel': bdist_wheel, 'build_ext': build_ext},
+    cmdclass=cmd_classes,
     license="MIT License",
-    packages=['onnxruntime',
-              'onnxruntime.backend',
-              'onnxruntime.capi',
-              'onnxruntime.datasets',
-              'onnxruntime.tools',
-              ],
+    packages=packages,
     ext_modules=ext_modules,
-    package_data={
-        'onnxruntime': data + examples + extra,
-    },
-    py_modules=python_modules_list,
-    extras_require={
-        'backend': ['onnx>=1.2.3'],
-        'numpy': ['numpy>=1.15.0']
-    },
+    package_data=package_data,
+    data_files=data_files,
+    install_requires=install_requires,
     entry_points= {
         'console_scripts': [
             'onnxruntime_test = onnxruntime.tools.onnxruntime_test:main',
         ]
     },
     classifiers=[
-        'Development Status :: 4 - Beta',
+        'Development Status :: 5 - Production/Stable',
         'Environment :: Console',
         'Intended Audience :: Developers',
+        'License :: OSI Approved :: MIT License',
         'Operating System :: POSIX :: Linux',
+        'Operating System :: Microsoft :: Windows',
+        'Operating System :: MacOS',
         'Programming Language :: Python',
         'Programming Language :: Python :: 3 :: Only',
         'Programming Language :: Python :: 3.5',

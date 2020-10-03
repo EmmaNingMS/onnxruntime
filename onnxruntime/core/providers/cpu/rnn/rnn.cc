@@ -1,8 +1,10 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
-#include "core/framework/op_kernel_context_internal.h"
 
 #include "core/providers/cpu/rnn/rnn.h"
+
+#include "core/common/safeint.h"
+#include "core/framework/op_kernel_context_internal.h"
 #include "core/providers/cpu/rnn/rnn_activation_functors.h"
 #include "core/providers/cpu/rnn/rnn_helpers.h"
 #include "core/util/math.h"
@@ -100,8 +102,7 @@ using EigenMatrixMapRowMajor = Eigen::Map<
 template <>
 Status RNN<float>::Compute(OpKernelContext* ctx) const {
   using namespace rnn::detail;
-  auto ctx_internal = static_cast<OpKernelContextInternal*>(ctx);
-  concurrency::ThreadPool* tp = ctx_internal->GetOperatorThreadPool();
+  concurrency::ThreadPool* tp = ctx->GetOperatorThreadPool();
 
   // inputs
   const Tensor& X = *ctx->Input<Tensor>(0);
@@ -118,7 +119,7 @@ Status RNN<float>::Compute(OpKernelContext* ctx) const {
   int64_t batch_size = X.Shape()[1];
   int64_t input_size = X.Shape()[2];
 
-  auto status = rnn::detail::ValidateCommonRnnInputs(X, W, R, B, 1, sequence_lens, initial_h,
+  auto status = rnn::detail::ValidateCommonRnnInputs(X, W.Shape(), R.Shape(), B, 1, sequence_lens, initial_h,
                                                      num_directions, hidden_size_);
   ORT_RETURN_IF_ERROR(status);
 
@@ -133,7 +134,7 @@ Status RNN<float>::Compute(OpKernelContext* ctx) const {
   ORT_RETURN_IF_ERROR(ctx->GetTempSpaceAllocator(&alloc));
 
   // X * W^t, each direction has shape of [seq_length, batch_size, hidden_size]
-  auto x_matmul_data = alloc->Alloc(sizeof(float) * seq_length * batch_size * hidden_size_);
+  auto x_matmul_data = alloc->Alloc(SafeInt<size_t>(sizeof(float)) * seq_length * batch_size * hidden_size_);
   BufferUniquePtr x_matmul_buffer(x_matmul_data, BufferDeleter(alloc));
   auto* x_matmul_w_buffer_data = static_cast<float*>(x_matmul_buffer.get());
 
@@ -143,7 +144,7 @@ Status RNN<float>::Compute(OpKernelContext* ctx) const {
   if (Y != nullptr)
     Y_buffer_data = Y->template MutableData<float>();
   else {
-    Y_data = alloc->Alloc(sizeof(float) * seq_length * num_directions * batch_size * hidden_size_);
+    Y_data = alloc->Alloc(SafeInt<size_t>(sizeof(float)) * seq_length * num_directions * batch_size * hidden_size_);
     Y_matmul_buffer = BufferUniquePtr(Y_data, BufferDeleter(alloc));
     Y_buffer_data = static_cast<float*>(Y_matmul_buffer.get());
   }
@@ -188,7 +189,7 @@ Status RNN<float>::Compute(OpKernelContext* ctx) const {
           // the shape of initial_h is [num_directions, batch_size, hidden_size]
           // so pick the offset (multiple of Y_frame_size == batch_size * hidden_size_)
           // based on the direction
-          h_prev = initial_h->template Data<float>() + (direction * Y_frame_size);        
+          h_prev = initial_h->template Data<float>() + (direction * Y_frame_size);
         }
       } else {
         if (isReverse)

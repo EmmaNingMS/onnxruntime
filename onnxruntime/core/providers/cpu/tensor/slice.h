@@ -7,9 +7,55 @@
 
 namespace onnxruntime {
 
+namespace SliceOp {
+struct PrepareForComputeMetadata {
+  PrepareForComputeMetadata() = delete;
+  PrepareForComputeMetadata(const std::vector<int64_t>& input_dimensions)
+      : input_dimensions_(input_dimensions) {
+    size_t dimension_count = input_dimensions.size();
+    starts_.resize(dimension_count, 0);
+    steps_.resize(dimension_count, 1);
+    output_dims_ = input_dimensions;
+  }
+
+  const std::vector<int64_t>& input_dimensions_;
+  std::vector<int64_t> starts_;
+  std::vector<int64_t> steps_;
+  std::vector<int64_t> output_dims_;
+  std::vector<int64_t> flattened_output_dims_;
+  std::vector<int64_t>* p_flattened_output_dims_ = &flattened_output_dims_;
+};
+}  // namespace SliceOp
+
 class SliceBase {
+  // static methods that can be used from other ops if needed
+ public:
+  // compute output_dims without steps (Slice V1-9 & DynamicSlice)
+  static Status PrepareForCompute(const std::vector<int64_t>& raw_starts,
+                                  const std::vector<int64_t>& raw_ends,
+                                  const std::vector<int64_t>& raw_axes,
+                                  SliceOp::PrepareForComputeMetadata& compute_metadata);
+
+  // compute output_dims with steps (Slice V10)
+  static Status PrepareForCompute(const std::vector<int64_t>& raw_starts,
+                                  const std::vector<int64_t>& raw_ends,
+                                  const std::vector<int64_t>& raw_axes,
+                                  const std::vector<int64_t>& raw_steps,
+                                  SliceOp::PrepareForComputeMetadata& compute_metadata);
+
+  // Slice V10 & DynamicSlice
+  static void FillVectorsFromInput(const Tensor& start_tensor,
+                                   const Tensor& ends_tensor,
+                                   const Tensor* axes_tensor,
+                                   const Tensor* steps_tensor,
+                                   std::vector<int64_t>& input_starts,
+                                   std::vector<int64_t>& input_ends,
+                                   std::vector<int64_t>& input_axes,
+                                   std::vector<int64_t>& input_steps);
+
  protected:
-  SliceBase(const OpKernelInfo& info, bool dynamic = false) {
+  SliceBase(const OpKernelInfo& info, bool dynamic = false)
+      : dynamic_(dynamic) {
     if (!dynamic) {
       auto has_starts = info.GetAttrs("starts", attr_starts_).IsOK();
       auto has_ends = info.GetAttrs("ends", attr_ends_).IsOK();
@@ -21,38 +67,26 @@ class SliceBase {
     }
   }
 
-  // compute output_dims without steps (Slice V1-9 & DynamicSlice)
-  Status PrepareForCompute(const std::vector<int64_t>& raw_starts,
-                           const std::vector<int64_t>& raw_ends,
-                           const std::vector<int64_t>& raw_axes,
-                           const std::vector<int64_t>& input_dimensions,
-                           std::vector<int64_t>& starts,
-                           std::vector<int64_t>& output_dims) const;
+  Status Compute(OpKernelContext* context) const;
 
-  // compute output_dims with steps (Slice V10)
-  Status PrepareForCompute(const std::vector<int64_t>& raw_starts,
-                           const std::vector<int64_t>& raw_ends,
-                           const std::vector<int64_t>& raw_axes,
-                           const std::vector<int64_t>& raw_steps,
-                           const std::vector<int64_t>& input_dimensions,
-                           std::vector<int64_t>& starts,
-                           std::vector<int64_t>& steps,
-                           std::vector<int64_t>& output_dims) const;
+ protected:
+  const std::vector<int64_t>& StartsAttribute() const { return attr_starts_; }
+  const std::vector<int64_t>& EndsAttribute() const { return attr_ends_; }
+  const std::vector<int64_t>& AxesAttribute() const { return attr_axes_; }
 
-  // Slice V10 & DynamicSlice
-  void FillVectorsFromInput(const OpKernelContext* context,
-                            std::vector<int64_t>& input_starts,
-                            std::vector<int64_t>& input_ends,
-                            std::vector<int64_t>& input_axes,
-                            std::vector<int64_t>& input_steps) const;
-
+ private:
+  bool dynamic_;
   std::vector<int64_t> attr_starts_, attr_ends_, attr_axes_;
 };
 
-template <typename T, bool dynamic>
-struct Slice final : public OpKernel, public SliceBase {
-  Slice(const OpKernelInfo& info) : OpKernel(info), SliceBase(info, dynamic) {}
-  Status Compute(OpKernelContext* context) const override;
-};  // namespace onnxruntime
+struct Slice1 final : public OpKernel, public SliceBase {
+  Slice1(const OpKernelInfo& info) : OpKernel(info), SliceBase(info, false) {}
+  Status Compute(OpKernelContext* context) const override { return SliceBase::Compute(context); }
+};
+
+struct Slice10 final : public OpKernel, public SliceBase {
+  Slice10(const OpKernelInfo& info) : OpKernel(info), SliceBase(info, true) {}
+  Status Compute(OpKernelContext* context) const override { return SliceBase::Compute(context); }
+};
 
 }  // namespace onnxruntime

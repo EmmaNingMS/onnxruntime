@@ -19,7 +19,6 @@ using OrtValueName = std::string;
 
 class SessionState;
 
-// AllocPlanPerValue: (a simplified form of AllocationPlanPerValue above)
 // Captures information required to allocate/reuse buffer for a ml-value
 struct AllocPlanPerValue {
   AllocKind alloc_kind{AllocKind::kAllocate};
@@ -33,7 +32,7 @@ struct AllocPlanPerValue {
   bool create_fence_if_async{false};
 
  public:
-  AllocPlanPerValue() : location(CPU, OrtArenaAllocator) {}
+  AllocPlanPerValue() : location(CPU, Invalid) {}
 };
 
 // SequentialExecutionPlan: This is the data that is produced by a static

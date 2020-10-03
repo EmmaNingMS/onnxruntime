@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "core/framework/op_kernel_context_internal.h"
 #include "nchwc_ops.h"
 #include "core/mlas/inc/mlas.h"
 
@@ -17,7 +16,7 @@ ONNX_CPU_OPERATOR_TYPED_NCHWC_KERNEL(
     float,
     KernelDefBuilder()
         .TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
-    ReorderInput<float>);
+    ReorderInput);
 
 ONNX_CPU_OPERATOR_TYPED_NCHWC_KERNEL(
     ReorderOutput,
@@ -25,7 +24,7 @@ ONNX_CPU_OPERATOR_TYPED_NCHWC_KERNEL(
     float,
     KernelDefBuilder()
         .TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
-    ReorderOutput<float>);
+    ReorderOutput);
 
 ONNX_CPU_OPERATOR_TYPED_NCHWC_KERNEL(
     Conv,
@@ -68,27 +67,51 @@ ONNX_CPU_OPERATOR_TYPED_NCHWC_KERNEL(
         .TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
     NchwcAveragePool);
 
-template <typename T>
-Status ReorderInput<T>::Compute(OpKernelContext* context) const {
+ONNX_CPU_OPERATOR_TYPED_NCHWC_KERNEL(
+    Upsample,
+    1,
+    float,
+    KernelDefBuilder()
+        .TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
+    NchwcUpsample);
+
+Status ReorderInput::Compute(OpKernelContext* context) const {
   const auto* X = context->Input<Tensor>(0);
   const auto& X_shape = X->Shape();
   ORT_ENFORCE(X_shape.NumDimensions() == 4);
   ORT_ENFORCE((X_shape[1] % MlasNchwcGetBlockSize()) == 0);
+
   auto* Y = context->Output(0, X_shape);
-  MlasReorderInput(X_shape.GetDims().data(), X->template Data<T>(), Y->template MutableData<T>());
+  MlasReorderInput(X_shape.GetDims().data(), X->template Data<float>(), Y->template MutableData<float>());
+
   return Status::OK();
 }
 
-template <typename T>
-Status ReorderOutput<T>::Compute(OpKernelContext* context) const {
+Status ReorderOutput::Compute(OpKernelContext* context) const {
   const auto* X = context->Input<Tensor>(0);
   const auto& X_shape = X->Shape();
-  ORT_ENFORCE(X_shape.NumDimensions() == 4);
-  std::vector<int64_t> Y_shape(X_shape.GetDims());
-  ORT_ENFORCE(channels_ <= Y_shape[1]);
-  Y_shape[1] = channels_;
+  const auto X_rank = X_shape.NumDimensions();
+  ORT_ENFORCE(X_rank == 4);
+  ORT_ENFORCE(channels_ <= X_shape[1]);
+
+  // Build the output shape in NCHW or NHWC order.
+  std::vector<int64_t> Y_shape(X_rank);
+  Y_shape[0] = X_shape[0];
+  Y_shape[channels_last_ ? X_rank - 1 : 1] = channels_;
+  auto* Y_spatial_dims = Y_shape.data() + (channels_last_ ? 1 : 2);
+  for (size_t i = 0; i < X_rank - 2; i++) {
+    Y_spatial_dims[i] = X_shape[2 + i];
+  }
   auto* Y = context->Output(0, Y_shape);
-  MlasReorderOutput(Y_shape.data(), X->template Data<T>(), Y->template MutableData<T>());
+
+  const auto* x_data = X->template Data<float>();
+  auto* y_data = Y->template MutableData<float>();
+  if (channels_last_) {
+    MlasReorderOutputNhwc(Y_shape.data(), x_data, y_data);
+  } else {
+    MlasReorderOutputNchw(Y_shape.data(), x_data, y_data);
+  }
+
   return Status::OK();
 }
 
@@ -98,7 +121,7 @@ Status NchwcConv::Compute(OpKernelContext* context) const {
   const auto* B = context->Input<Tensor>(2);
   const auto* Sum = context->Input<Tensor>(3);
 
-  ORT_RETURN_IF_ERROR(ConvBase::ValidateInputShape(X, W));
+  ORT_RETURN_IF_ERROR(conv_attrs_.ValidateInputShape(X, W));
 
   const auto& X_shape = X->Shape();
   const auto& W_shape = W->Shape();
@@ -108,20 +131,20 @@ Status NchwcConv::Compute(OpKernelContext* context) const {
   ORT_ENFORCE((static_cast<size_t>(X_shape[1]) < nchwc_block_size) || ((X_shape[1] % nchwc_block_size) == 0));
 
   std::vector<int64_t> kernel_shape;
-  ORT_RETURN_IF_ERROR(ConvBase::ComputeKernelShape(W_shape, kernel_shape));
+  ORT_RETURN_IF_ERROR(conv_attrs_.ComputeKernelShape(W_shape, kernel_shape));
   if (kernel_shape.size() != 2) {
     return Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Unsupported convolution size.");
   }
 
-  std::vector<int64_t> pads(ConvBase::pads_);
+  std::vector<int64_t> pads(conv_attrs_.pads);
   if (pads.empty()) {
     pads.resize(kernel_shape.size() * 2, 0);
   }
-  std::vector<int64_t> dilations(ConvBase::dilations_);
+  std::vector<int64_t> dilations(conv_attrs_.dilations);
   if (dilations.empty()) {
     dilations.resize(kernel_shape.size(), 1);
   }
-  std::vector<int64_t> strides(ConvBase::strides_);
+  std::vector<int64_t> strides(conv_attrs_.strides);
   if (strides.empty()) {
     strides.resize(kernel_shape.size(), 1);
   }
@@ -129,7 +152,7 @@ Status NchwcConv::Compute(OpKernelContext* context) const {
   std::vector<int64_t> Y_dims;
   Y_dims.insert(Y_dims.begin(), {X_shape[0], W_shape[0]});
   TensorShape input_shape = X->Shape().Slice(2);
-  ORT_RETURN_IF_ERROR(ConvBase::InferOutputShape(input_shape, kernel_shape, strides, dilations, &pads, &Y_dims));
+  ORT_RETURN_IF_ERROR(conv_attrs_.InferOutputShape(input_shape, kernel_shape, strides, dilations, pads, Y_dims));
   auto* Y = context->Output(0, Y_dims);
   auto* y_data = Y->template MutableData<float>();
 
@@ -144,48 +167,44 @@ Status NchwcConv::Compute(OpKernelContext* context) const {
     }
   }
 
-  MlasNchwcConv(kernel_shape.size(),
-                X_shape.GetDims().data(),
+  MlasNchwcConv(X_shape.GetDims().data(),
                 kernel_shape.data(),
                 dilations.data(),
                 pads.data(),
                 strides.data(),
                 Y_dims.data(),
-                static_cast<size_t>(ConvBase::group_),
+                static_cast<size_t>(conv_attrs_.group),
                 X->template Data<float>(),
                 W->template Data<float>(),
                 B != nullptr ? B->template Data<float>() : nullptr,
                 y_data,
                 &activation_,
                 Sum == nullptr,
-                const_cast<concurrency::ThreadPool*>(static_cast<OpKernelContextInternal*>(context)->GetOperatorThreadPool()));
+                context->GetOperatorThreadPool());
 
   return Status::OK();
 }
 
 Status NchwcPoolBase::NchwcPool(OpKernelContext* context, MLAS_POOLING_KIND kind) const {
   const auto* X = context->Input<Tensor>(0);
-
   const auto& X_shape = X->Shape();
   ORT_ENFORCE(X_shape.NumDimensions() == 4);
   ORT_ENFORCE((X_shape[1] % MlasNchwcGetBlockSize()) == 0);
 
-
-  std::vector<int64_t> pads = pads_;
-  std::vector<int64_t> output_dims = PoolBase::SetOutputSize(X_shape, X_shape[1], &pads, dilations_, ceil_mode_);
+  std::vector<int64_t> pads = pool_attrs_.pads;
+  std::vector<int64_t> output_dims = pool_attrs_.SetOutputSize(X_shape, X_shape[1], &pads);
   auto* Y = context->Output(0, output_dims);
 
   MlasNchwcPool(kind,
-                2,
                 X_shape.GetDims().data(),
-                global_pooling_ ? nullptr : kernel_shape_.data(),
-                global_pooling_ ? nullptr : dilations_.data(),
-                global_pooling_ ? nullptr : pads.data(),
-                global_pooling_ ? nullptr : strides_.data(),
+                pool_attrs_.global_pooling ? nullptr : pool_attrs_.kernel_shape.data(),
+                pool_attrs_.global_pooling ? nullptr : pool_attrs_.dilations.data(),
+                pool_attrs_.global_pooling ? nullptr : pads.data(),
+                pool_attrs_.global_pooling ? nullptr : pool_attrs_.strides.data(),
                 output_dims.data(),
                 X->template Data<float>(),
                 Y->template MutableData<float>(),
-                const_cast<concurrency::ThreadPool*>(static_cast<OpKernelContextInternal*>(context)->GetOperatorThreadPool()));
+                context->GetOperatorThreadPool());
 
   return Status::OK();
 }
@@ -195,7 +214,25 @@ Status NchwcMaxPool::Compute(OpKernelContext* context) const {
 }
 
 Status NchwcAveragePool::Compute(OpKernelContext* context) const {
-  return NchwcPoolBase::NchwcPool(context, count_include_pad_ ? MlasAveragePoolingIncludePad : MlasAveragePoolingExcludePad);
+  return NchwcPoolBase::NchwcPool(context, pool_attrs_.count_include_pad ? MlasAveragePoolingIncludePad
+                                                                         : MlasAveragePoolingExcludePad);
+}
+
+Status NchwcUpsample::Compute(OpKernelContext* context) const {
+  const auto* X = context->Input<Tensor>(0);
+  const auto& X_shape = X->Shape();
+  ORT_ENFORCE(X_shape.NumDimensions() == 4);
+  ORT_ENFORCE((X_shape[1] % MlasNchwcGetBlockSize()) == 0);
+
+  TensorShape Y_shape{X_shape[0], X_shape[1], X_shape[2] * scales_[2], X_shape[3] * scales_[3]};
+  auto* Y = context->Output(0, Y_shape);
+
+  MlasNchwcUpsample(X_shape.GetDims().data(),
+                    scales_.data() + 2,
+                    X->template Data<float>(),
+                    Y->template MutableData<float>());
+
+  return Status::OK();
 }
 
 }  // namespace contrib

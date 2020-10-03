@@ -7,33 +7,61 @@ o) OPENVINO_VERSION=${OPTARG};;
 esac
 done
 
-OPENVINO_VERSION=${OPENVINO_VERSION:=2019_R1.1}
-git clone https://github.com/opencv/dldt.git /data/dldt/openvino_2019.1.144
+OPENVINO_VERSION=${OPENVINO_VERSION:=2020.4}
+export INTEL_OPENVINO_DIR=/data/openvino/openvino_${OPENVINO_VERSION}.287
+export INTEL_OPENVINO_SRC_DIR=/data/openvino/openvino_src
+git clone https://github.com/openvinotoolkit/openvino.git ${INTEL_OPENVINO_SRC_DIR}
 
-export INTEL_CVSDK_DIR=/data/dldt/openvino_2019.1.144
 apt-get update && apt-get -y  install libusb-1.0-0-dev
 
-cd ${INTEL_CVSDK_DIR}/inference-engine
+cd $INTEL_OPENVINO_SRC_DIR
+git checkout tags/$OPENVINO_VERSION -b $OPENVINO_VERSION
 git submodule init
 git submodule update --recursive
-git checkout tags/$OPENVINO_VERSION -b $OPENVINO_VERSION
 
+
+host_cpu=$(uname -m)
+sudo -E apt update
+sudo -E apt-get install -y \
+    build-essential \
+    curl \
+    wget \
+    libssl-dev \
+    ca-certificates \
+    git \
+    libboost-regex-dev \
+    gcc-multilib g++-multilib \
+    libgtk2.0-dev \
+    pkg-config \
+    unzip \
+    automake \
+    libtool \
+    autoconf \
+    libcairo2-dev \
+    libpango1.0-dev \
+    libglib2.0-dev \
+    libgtk2.0-dev \
+    libswscale-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libgstreamer1.0-0 \
+    gstreamer1.0-plugins-base \
+    libusb-1.0-0-dev \
+    libopenblas-dev
+
+if apt-cache search --names-only '^libpng12-dev'| grep -q libpng12; then
+    sudo -E apt-get install -y libpng12-dev
+else
+    sudo -E apt-get install -y libpng-dev
+fi
+    
 mkdir -p build
 cd build
-cmake ..
-make -j$(nproc)
 
-cd ${INTEL_CVSDK_DIR}
-mkdir -p deployment_tools
-mv inference-engine inference_engine && mv inference_engine deployment_tools/
-mv model-optimizer model_optimizer && mv model_optimizer deployment_tools/
+mkdir -p $INTEL_OPENVINO_DIR
 
-cd ${INTEL_CVSDK_DIR}/deployment_tools/model_optimizer/install_prerequisites && ./install_prerequisites_onnx.sh
-
-cd ${INTEL_CVSDK_DIR}/deployment_tools/inference_engine
-mkdir -p lib/intel64
-mkdir -p external/tbb/lib
-mv bin/intel64/Release/lib/* lib/intel64
-mv temp/tbb/lib/* external/tbb/lib
+cmake -DCMAKE_INSTALL_PREFIX=${INTEL_OPENVINO_DIR} -DNGRAPH_COMPONENT_PREFIX=deployment_tools/ngraph/ -DCMAKE_BUILD_TYPE=Release ..
+make --jobs=$(nproc --all)
+make install
 
 cd ~

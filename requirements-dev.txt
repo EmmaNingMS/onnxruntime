@@ -1,3 +1,4 @@
+cerberus
 codecov
 jinja2
 numpy
@@ -10,6 +11,5 @@ pytest
 pytest-cov
 scikit-learn
 scipy
-six
 sympy
 wheel

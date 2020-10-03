@@ -4,16 +4,15 @@
 #pragma once
 
 #include <vector>
-#include <condition_variable>
 #include "core/common/common.h"
 #include "core/common/status.h"
 #include "core/common/logging/logging.h"
-#include "core/platform/ort_mutex.h"
 #include "core/framework/iexecutor.h"
 #include "core/framework/framework_common.h"
 #include "core/framework/ml_value.h"
 #include "core/framework/session_state.h"
 #include "core/graph/graph_viewer.h"
+#include "core/platform/ort_mutex.h"
 
 namespace onnxruntime {
 
@@ -62,6 +61,6 @@ class ParallelExecutor : public IExecutor {
 
   const bool& terminate_flag_;
   // TODO: Temporary threadpool for the executor.  This is a costly way to handle the problem.
-  std::unique_ptr<onnxruntime::concurrency::ThreadPool> executor_pool_;
+  onnxruntime::concurrency::ThreadPool* const executor_pool_{};
 };
 }  // namespace onnxruntime

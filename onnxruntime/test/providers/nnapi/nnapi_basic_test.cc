@@ -1,9 +1,9 @@
+#include "core/common/logging/logging.h"
+#include "core/providers/nnapi/nnapi_builtin/nnapi_execution_provider.h"
 #include "core/session/inference_session.h"
+#include "gtest/gtest.h"
 #include "test/providers/provider_test_utils.h"
 #include "test/framework/test_utils.h"
-#include "gtest/gtest.h"
-#include "core/providers/nnapi/nnapi_execution_provider.h"
-#include "core/common/logging/logging.h"
 
 using namespace std;
 using namespace ONNX_NAMESPACE;
@@ -23,7 +23,7 @@ void VerifyOutputs(const std::vector<OrtValue>& fetches, const std::vector<int64
 }
 
 TEST(NnapiExecutionProviderTest, FunctionTest) {
-  onnxruntime::Model model("graph_1");
+  onnxruntime::Model model("graph_1", false, DefaultLoggingManager().DefaultLogger());
   auto& graph = model.MainGraph();
   std::vector<onnxruntime::NodeArg*> inputs;
   std::vector<onnxruntime::NodeArg*> outputs;
@@ -85,8 +85,8 @@ TEST(NnapiExecutionProviderTest, FunctionTest) {
   RunOptions run_options;
   run_options.run_tag = so.session_logid;
 
-  InferenceSession session_object{so};
-  status = session_object.RegisterExecutionProvider(std::make_unique<::onnxruntime::NnapiExecutionProvider>());
+  InferenceSession session_object{so, GetEnvironment()};
+  status = session_object.RegisterExecutionProvider(onnxruntime::make_unique<::onnxruntime::NnapiExecutionProvider>());
   ASSERT_TRUE(status.IsOK());
   status = session_object.Load(model_file_name);
   ASSERT_TRUE(status.IsOK());
@@ -100,4 +100,3 @@ TEST(NnapiExecutionProviderTest, FunctionTest) {
 }
 }  // namespace test
 }  // namespace onnxruntime
-

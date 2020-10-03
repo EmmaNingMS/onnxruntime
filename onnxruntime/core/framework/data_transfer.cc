@@ -9,6 +9,14 @@ common::Status IDataTransfer::CopyTensor(const Tensor& src, Tensor& dst) const {
   return CopyTensor(src, dst, 0);
 }
 
+common::Status IDataTransfer::CopyTensors(const std::vector<IDataTransfer::SrcDstPair>& src_dst_pairs) const {
+  for (const auto& pair : src_dst_pairs) {
+    ORT_RETURN_IF_ERROR(CopyTensor(pair.src, pair.dst, pair.exec_queue_id));
+  }
+
+  return Status::OK();
+}
+
 bool CPUDataTransfer::CanCopy(const OrtDevice& src_device, const OrtDevice& dst_device) const {
   return src_device.Type() == OrtDevice::CPU && dst_device.Type() == OrtDevice::CPU;
 }

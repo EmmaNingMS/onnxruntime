@@ -6,12 +6,10 @@
 #include "core/providers/nuphar/runtime/control_flow/scan_exec_ctx.h"
 #include "core/framework/op_kernel.h"
 #include "core/framework/tensorprotoutils.h"
+#include "core/framework/onnxruntime_typeinfo.h"
 #include "core/codegen/common/common.h"
 #include "core/providers/nuphar/common/analysis/subgraph_codegen_stats.h"
 #include <unordered_map>
-
-// from onnxruntime_typeinf.cc, in global namespace
-const onnxruntime::DataTypeImpl* ElementTypeFromProto(int type);
 
 namespace onnxruntime {
 namespace nuphar {
@@ -64,7 +62,7 @@ static void FillBasicFuncInfo(NupharFuncInfo* func_info,
 
     // fill in func args
     NupharFuncInfo::FuncArgMeta input_meta;
-    input_meta.dtype = ElementTypeFromProto(def->TypeAsProto()->tensor_type().elem_type());
+    input_meta.dtype = OrtTypeInfo::ElementTypeFromProto(def->TypeAsProto()->tensor_type().elem_type());
     input_meta.ort_arg_index = def_index;
 
     // fill in shape info and symobolic info
@@ -160,7 +158,7 @@ static void FillBasicFuncInfo(NupharFuncInfo* func_info,
     }
 
     NupharFuncInfo::FuncArgMeta output_meta;
-    output_meta.dtype = ElementTypeFromProto(def->TypeAsProto()->tensor_type().elem_type());
+    output_meta.dtype = OrtTypeInfo::ElementTypeFromProto(def->TypeAsProto()->tensor_type().elem_type());
     output_meta.ort_arg_index = def_index;
 
     // fill in shape info and symobolic info
@@ -199,7 +197,7 @@ static void FillScanExecInfo(NupharFuncInfo* func_info,
   ORT_ENFORCE(nullptr != partition_info);
 
   // create Scan control-flow info
-  auto scan_info = std::make_unique<ScanExecInfo>();
+  auto scan_info = onnxruntime::make_unique<ScanExecInfo>();
 
   int64_t num_state_variables;
   int64_t num_scan_inputs;
@@ -345,7 +343,7 @@ static void FillScanExecInfo(NupharFuncInfo* func_info,
     }
 
     NupharFuncInfo::FuncArgMeta input_meta;
-    input_meta.dtype = ElementTypeFromProto(def->TypeAsProto()->tensor_type().elem_type());
+    input_meta.dtype = OrtTypeInfo::ElementTypeFromProto(def->TypeAsProto()->tensor_type().elem_type());
     input_meta.ort_arg_index = gsl::narrow_cast<int>(ort_input_idx);
 
     // fill in shape info and symobolic info
@@ -395,7 +393,7 @@ static void FillScanExecInfo(NupharFuncInfo* func_info,
     }
 
     NupharFuncInfo::FuncArgMeta input_meta;
-    input_meta.dtype = ElementTypeFromProto(def->TypeAsProto()->tensor_type().elem_type());
+    input_meta.dtype = OrtTypeInfo::ElementTypeFromProto(def->TypeAsProto()->tensor_type().elem_type());
     input_meta.ort_arg_index = gsl::narrow_cast<int>(ort_input_idx);
 
     std::vector<std::pair<size_t, std::string>> symbols;
@@ -486,19 +484,31 @@ static void FillScanExecInfo(NupharFuncInfo* func_info,
 
     int ort_arg_index = gsl::narrow_cast<int>(ort_output_idx);
     if (ort_output_idx < gsl::narrow<size_t>(num_state_variables)) {
+      auto key_iter = visited_output_def_indices.find(key);
       // if ort_output_idx is a state output
-      if (visited_output_def_indices.count(key) != 0) {
+      if (key_iter != visited_output_def_indices.end()) {
         // If state output is an alias
-        // record i_output for the lookup of the aliased output later
-        visited_output_state_func_indices.insert(std::make_pair(key, gsl::narrow<int>(func_info->func_input_count + tvm_output_idx)));
+
+        auto output_tvm_idx = key_iter->second - gsl::narrow_cast<int>(num_state_variables);
 
         // also record ort_aliased_output_to_func_indices
-        func_info->ort_aliased_output_to_func_indices.push_back(std::make_pair(gsl::narrow<int>(ort_output_idx),
-                                                                               func_info->func_input_count + tvm_output_idx));
+        func_info->ort_aliased_output_to_func_indices.push_back(
+            std::make_pair(gsl::narrow<int>(ort_output_idx), func_info->func_input_count + output_tvm_idx));
 
-        scan_info->state_to_output_indices.push_back(visited_output_def_indices[key] - gsl::narrow_cast<int>(num_state_variables));
-        // override ort_arg_index using the output index
-        ort_arg_index = visited_output_def_indices[key];
+        scan_info->state_to_output_indices.push_back(output_tvm_idx);
+
+        if (visited_output_state_func_indices.count(key) != 0) {
+          // We could have multiple states that alias to the same output.
+          // We only record the first one and skip the rest.
+          continue;
+        } else {
+          // record i_output for the lookup of the aliased output later
+          visited_output_state_func_indices.insert(
+              std::make_pair(key, gsl::narrow<int>(func_info->func_input_count + output_tvm_idx)));
+
+          // override ort_arg_index using the output index
+          ort_arg_index = visited_output_def_indices[key];
+        }
       } else {
         // the state output not aliased(no scan output shares with it)
         scan_info->state_to_output_indices.push_back(NupharFuncInfo::Index_NonAliasedOutput);
@@ -506,15 +516,13 @@ static void FillScanExecInfo(NupharFuncInfo* func_info,
     } else {
       // if ort_output_idx is an output
       if (visited_output_state_func_indices.count(key) != 0) {
-        if (source_def != nullptr) {
-          // skip a duplicated output, since it was counted in the duplicated state output previously
-          continue;
-        }
+        // skip a duplicated output, since it was counted in the duplicated state output previously
+        continue;
       }
     }
 
     NupharFuncInfo::FuncArgMeta output_meta;
-    output_meta.dtype = ElementTypeFromProto(def->TypeAsProto()->tensor_type().elem_type());
+    output_meta.dtype = OrtTypeInfo::ElementTypeFromProto(def->TypeAsProto()->tensor_type().elem_type());
     output_meta.ort_arg_index = ort_arg_index;
 
     // shape and symbols

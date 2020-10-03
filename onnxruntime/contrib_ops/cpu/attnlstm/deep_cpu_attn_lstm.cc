@@ -10,7 +10,6 @@
 #include "core/common/logging/logging.h"
 #include "core/platform/threadpool.h"
 #include "core/framework/allocator.h"
-#include "core/framework/op_kernel_context_internal.h"
 
 namespace onnxruntime {
 namespace contrib {
@@ -38,15 +37,19 @@ DeepCpuAttnLstmOp::Compute(OpKernelContext* context) const {
   Status status;
   // auto& logger = context->Logger();
 
-  auto data_type = X.DataType();
-  if (data_type == DataTypeImpl::GetType<float>())
-    status = ComputeImpl<float>(*context);
-  else if (data_type == DataTypeImpl::GetType<double>()) {
-    /* Need to update all the helpers to support double...
+  switch (X.GetElementType()) {
+    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT:
+      status = ComputeImpl<float>(*context);
+      break;
+    case ONNX_NAMESPACE::TensorProto_DataType_DOUBLE:
+      /* Need to update all the helpers to support double...
     status = ComputeImpl<double>(*context); */
-    ORT_NOT_IMPLEMENTED("LSTM operator does not support double yet");
-  } else
-    ORT_THROW("Invalid data type for LSTM operator of ", data_type);
+      ORT_NOT_IMPLEMENTED("LSTM operator does not support double yet");
+      break;
+    default:
+      ORT_THROW("Invalid data type for LSTM operator of ", X.DataType());
+      break;
+  }
 
   return status;
 }
@@ -72,9 +75,6 @@ static gsl::span<const T> SecondHalfSpan(const gsl::span<const T>& dspan) {
 
 template <typename T>
 Status DeepCpuAttnLstmOp::ComputeImpl(OpKernelContext& context) const {
-  auto ctx_internal = static_cast<OpKernelContextInternal*>(&context);
-  concurrency::ThreadPool* thread_pool = ctx_internal->GetOperatorThreadPool();
-
   auto& logger = context.Logger();
 
   // original lstm processing
@@ -204,6 +204,8 @@ Status DeepCpuAttnLstmOp::ComputeImpl(OpKernelContext& context) const {
       std::fill(output.begin() + start, output.end(), T{});
     }
   }
+
+  concurrency::ThreadPool* thread_pool = context.GetOperatorThreadPool();
 
   if (direction_ == Direction::kBidirectional) {
     // spans for second direction

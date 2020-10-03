@@ -1,8 +1,8 @@
 // Copyright 2019 JD.com Inc. JD AI
 
 #include "core/providers/nnapi/nnapi_provider_factory.h"
-#include "nnapi_execution_provider.h"
 #include "core/session/abi_session_options_impl.h"
+#include "nnapi_builtin/nnapi_execution_provider.h"
 
 using namespace onnxruntime;
 
@@ -16,7 +16,7 @@ struct NnapiProviderFactory : IExecutionProviderFactory {
 };
 
 std::unique_ptr<IExecutionProvider> NnapiProviderFactory::CreateProvider() {
-  return std::make_unique<NnapiExecutionProvider>();
+  return onnxruntime::make_unique<NnapiExecutionProvider>();
 }
 
 std::shared_ptr<IExecutionProviderFactory> CreateExecutionProviderFactory_Nnapi() {
@@ -28,5 +28,3 @@ ORT_API_STATUS_IMPL(OrtSessionOptionsAppendExecutionProvider_Nnapi, _In_ OrtSess
   options->provider_factories.push_back(onnxruntime::CreateExecutionProviderFactory_Nnapi());
   return nullptr;
 }
-
-

@@ -10,6 +10,48 @@
 namespace onnxruntime {
 namespace test {
 
+// Dummy Arena which just call underline device allocator directly.
+class DummyArena : public IArenaAllocator {
+ public:
+  explicit DummyArena(std::unique_ptr<IAllocator> resource_allocator)
+      : IArenaAllocator(OrtMemoryInfo(resource_allocator->Info().name,
+                                      OrtAllocatorType::OrtArenaAllocator,
+                                      resource_allocator->Info().device,
+                                      resource_allocator->Info().id,
+                                      resource_allocator->Info().mem_type)),
+        allocator_(std::move(resource_allocator)) {
+  }
+
+  ~DummyArena() override = default;
+
+  void* Alloc(size_t size) override {
+    if (size == 0)
+      return nullptr;
+    return allocator_->Alloc(size);
+  }
+
+  void Free(void* p) override {
+    allocator_->Free(p);
+  }
+
+  void* Reserve(size_t size) override {
+    return Alloc(size);
+  }
+
+  size_t Used() const override {
+    ORT_NOT_IMPLEMENTED(__FUNCTION__, " is not implemented");
+  }
+
+  size_t Max() const override {
+    ORT_NOT_IMPLEMENTED(__FUNCTION__, " is not implemented");
+  }
+
+ private:
+  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(DummyArena);
+
+  std::unique_ptr<IAllocator> allocator_;
+};
+
 static std::string GetAllocatorId(const std::string& name, const int id, const bool isArena) {
   std::ostringstream ss;
   if (isArena)
@@ -21,7 +63,7 @@ static std::string GetAllocatorId(const std::string& name, const int id, const b
 }
 
 static Status RegisterAllocator(std::unordered_map<std::string, AllocatorPtr>& map,
-                                std::unique_ptr<IDeviceAllocator> allocator, size_t /*memory_limit*/,
+                                std::unique_ptr<IAllocator> allocator, size_t /*memory_limit*/,
                                 bool use_arena) {
   auto& info = allocator->Info();
   auto allocator_id = GetAllocatorId(info.name, info.id, use_arena);
@@ -49,13 +91,13 @@ AllocatorManager::AllocatorManager() {
 }
 
 Status AllocatorManager::InitializeAllocators() {
-  auto cpu_alocator = std::make_unique<CPUAllocator>();
+  auto cpu_alocator = onnxruntime::make_unique<CPUAllocator>();
   ORT_RETURN_IF_ERROR(RegisterAllocator(map_, std::move(cpu_alocator), std::numeric_limits<size_t>::max(), true));
 #ifdef USE_CUDA
-  auto cuda_alocator = std::make_unique<CUDAAllocator>(0, CUDA);
+  auto cuda_alocator = onnxruntime::make_unique<CUDAAllocator>(static_cast<OrtDevice::DeviceId>(0), CUDA);
   ORT_RETURN_IF_ERROR(RegisterAllocator(map_, std::move(cuda_alocator), std::numeric_limits<size_t>::max(), true));
 
-  auto cuda_pinned_alocator = std::make_unique<CUDAPinnedAllocator>(0, CUDA_PINNED);
+  auto cuda_pinned_alocator = onnxruntime::make_unique<CUDAPinnedAllocator>(static_cast<OrtDevice::DeviceId>(0), CUDA_PINNED);
   ORT_RETURN_IF_ERROR(RegisterAllocator(map_, std::move(cuda_pinned_alocator), std::numeric_limits<size_t>::max(), true));
 #endif  // USE_CUDA
 

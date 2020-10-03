@@ -6,7 +6,7 @@
 #include "core/common/common.h"
 #include "core/framework/op_kernel.h"
 
-#include "gsl/gsl_util"
+#include "gsl/gsl"
 
 namespace onnxruntime {
 
@@ -22,8 +22,7 @@ class Shape final : public OpKernel {
     const TensorShape& inputShape = input->Shape();
 
     size_t nDims = inputShape.NumDimensions();
-    TensorShape outputShape({gsl::narrow_cast<int64_t>(nDims)});
-    Tensor* output = context->Output(0, TensorShape(outputShape));
+    Tensor* output = context->Output(0, {gsl::narrow_cast<int64_t>(nDims)});
 
     inputShape.CopyDims(output->template MutableData<int64_t>(), nDims);
     return Status::OK();

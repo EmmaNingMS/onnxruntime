@@ -52,8 +52,10 @@ void CountGemmOp(const onnxruntime::Node& node,
 
   auto inputs = node.InputDefs();
   CountMatrixArgs(inputs[0], inputs[1], node, graph_inputs, shape_func, node_use_counts);
-  // C's use cnt is fixed.
-  CountNodeArg(inputs[2], node, graph_inputs, node_use_counts, 1);
+  if (inputs.size() > 2) {
+    // C's use cnt is fixed.
+    CountNodeArg(inputs[2], node, graph_inputs, node_use_counts, 1);
+  }
 }
 
 void CountMatMulOp(const onnxruntime::Node& node,
@@ -177,7 +179,7 @@ void InternalUseCountAnalysis::Traverse(
       Traverse(ConvertGraphNodesToNodePtrs(func_body.Nodes()), graph_inputs, graph_outputs);
     } else if (IsSoftmaxOp(op_type)) {
       CountSoftmaxOp(*node, graph_inputs, shape_func_, node_use_counts_);
-    } else {
+    } else if (op_type != "Shape") {  //don't count on Shape node input, because of no data dependency
       int use_count = 1;
       node->ForEachWithIndex(
           node->InputDefs(),
@@ -228,7 +230,7 @@ int InternalUseCountAnalysis::NodeUseCount(const onnxruntime::Node* node) const 
 
 OrtUseCountAnalysis::OrtUseCountAnalysis(const std::shared_ptr<ShapeExprContext>& shape_inference)
     : OrtAnalysis("OrtUseCountAnalysis") {
-  internal_analysis_ = std::make_unique<InternalUseCountAnalysis>(shape_inference);
+  internal_analysis_ = onnxruntime::make_unique<InternalUseCountAnalysis>(shape_inference);
 }
 
 void OrtUseCountAnalysis::Evaluate(const onnxruntime::GraphViewer& graph) {
@@ -245,7 +247,7 @@ int OrtUseCountAnalysis::NodeUseCount(const onnxruntime::Node* node) const {
 
 NupharUseCountAnalysis::NupharUseCountAnalysis(const std::shared_ptr<ShapeExprContext>& shape_inference)
     : NupharAnalysis("NupharUseCountAnalysis") {
-  internal_analysis_ = std::make_unique<InternalUseCountAnalysis>(shape_inference);
+  internal_analysis_ = onnxruntime::make_unique<InternalUseCountAnalysis>(shape_inference);
 }
 
 void NupharUseCountAnalysis::Evaluate(const onnxruntime::nuphar::NupharSubgraphUnit& graph) {

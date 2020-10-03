@@ -9,7 +9,7 @@
 
 #include "core/providers/nuphar/mti_x86/math/unary_ops.h"
 #include "core/providers/nuphar/mti_x86/math/reduce_ops.h"
-#include "gsl/gsl_util"
+#include "gsl/gsl"
 
 namespace onnxruntime {
 namespace nuphar {
@@ -32,16 +32,15 @@ static int32_t FuseDim(int64_t axis) {
 
 tvm::Tensor SoftmaxInternal(const tvm::Tensor& input,
                             int64_t axis,
+                            int64_t vector_width,
                             const std::string& name,
                             bool logarithmic) {
   std ::vector<int64_t> reduce_axis = ReduceAxes(axis, input->shape.size());
-  // TODO use natural vector size check by type later
-  int32_t vectorization_width = 16;
   int32_t fuse_dim = FuseDim(axis);
-  auto max_element = ReduceMax(input, reduce_axis, true, vectorization_width, false, fuse_dim, name + "_reduce_max");
+  auto max_element = ReduceMax(input, reduce_axis, true, vector_width, false, fuse_dim, name + "_reduce_max");
   auto x_shift = tvm_codegen::Sub(input, max_element, name + "_sub");
   auto exp_x = nuphar::Exp(x_shift, name + "_exp");
-  auto exp_x_sum = ReduceSum(exp_x, reduce_axis, true, vectorization_width, false, fuse_dim, name + "_reduce_sum");
+  auto exp_x_sum = ReduceSum(exp_x, reduce_axis, true, vector_width, false, fuse_dim, name + "_reduce_sum");
 
   if (logarithmic) {
     auto log_exp_x_sum = nuphar::Log(exp_x_sum, name + "_log");

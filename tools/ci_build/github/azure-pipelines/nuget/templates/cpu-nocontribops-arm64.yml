@@ -1,47 +1,53 @@
-# Defined as pipeline variables
-# variables:
-#   AgentPoolWin : 'Win-CPU'
-#   AgentPoolLinux : 'Linux-CPU'
-#   AgentPoolMacOS : 'macOS-10.13'
-
 parameters:
   DoEsrp: 'false'
 
-jobs:
-- template: ../../templates/win-ci.yml
+jobs:  
+- template: ../../templates/win-ci-2019.yml
   parameters:
-    AgentPool : $(AgentPoolWin)
+    AgentPool : 'Win-CPU-2019'
+    ArtifactName: 'drop-nuget'
     JobName: 'Windows_CI_Dev'
-    BuildCommand:  '$(Build.SourcesDirectory)\tools\ci_build\build.py --build_dir $(Build.BinariesDirectory) --skip_submodule_sync --cmake_path $(Build.BinariesDirectory)\cmake\bin\cmake.exe --ctest_path $(Build.BinariesDirectory)\cmake\bin\ctest.exe --disable_contrib_ops --enable_msvc_static_runtime --build_shared_lib --build_csharp --enable_onnx_tests'
+    BuildCommand:  '--build_dir $(Build.BinariesDirectory) --skip_submodule_sync --build_shared_lib --enable_onnx_tests --cmake_generator "Visual Studio 16 2019" --disable_contrib_ops --disable_ml_ops --enable_msvc_static_runtime'
+    BuildArch: 'x64'    
+    EnvSetupScript: 'setup_env.bat'
+    sln_platform: 'x64'
     DoDebugBuild: 'false'
     DoNugetPack : 'true'
-    DoCompliance: 'false'
+    DoCompliance: ${{ parameters.DoCompliance }}
     DoEsrp: ${{ parameters.DoEsrp }}
     NuPackScript: |
      msbuild $(Build.SourcesDirectory)\csharp\OnnxRuntime.CSharp.proj /p:Configuration=RelWithDebInfo /t:CreatePackage
      copy $(Build.SourcesDirectory)\csharp\src\Microsoft.ML.OnnxRuntime\bin\RelWithDebInfo\*.nupkg $(Build.ArtifactStagingDirectory)
+     copy $(Build.BinariesDirectory)\RelWithDebInfo\RelWithDebInfo\*.nupkg $(Build.ArtifactStagingDirectory)
+     mkdir $(Build.ArtifactStagingDirectory)\testdata
+     copy $(Build.BinariesDirectory)\RelWithDebInfo\RelWithDebInfo\custom_op_library.* $(Build.ArtifactStagingDirectory)\testdata
 
-
-- template: ../../templates/win-x86-ci.yml
+- template: ../../templates/win-ci-2019.yml
   parameters:
-    AgentPool : $(AgentPoolWin)
+    AgentPool : 'Win-CPU-2019'
+    ArtifactName: 'drop-win-x86-zip'
     JobName: 'Windows_CI_Dev_x86'
-    BuildCommand: '$(Build.SourcesDirectory)\tools\ci_build\build.py --build_dir $(Build.BinariesDirectory) --skip_submodule_sync --cmake_path $(Build.BinariesDirectory)\cmake\bin\cmake.exe --ctest_path $(Build.BinariesDirectory)\cmake\bin\ctest.exe --disable_contrib_ops --enable_msvc_static_runtime --build_shared_lib  --build_csharp --enable_onnx_tests --x86'
+    BuildCommand: '--build_dir $(Build.BinariesDirectory) --skip_submodule_sync --build_shared_lib --enable_onnx_tests --x86 --cmake_generator "Visual Studio 16 2019" --disable_contrib_ops --disable_ml_ops --enable_msvc_static_runtime'
+    BuildArch: 'x86'
+    EnvSetupScript: 'setup_env_x86.bat'
+    sln_platform: 'Win32'
     DoDebugBuild: 'false'
     DoNugetPack : 'true'
     DoCompliance: 'false'
     DoEsrp: ${{ parameters.DoEsrp }}
     NuPackScript: |
      msbuild $(Build.SourcesDirectory)\csharp\OnnxRuntime.CSharp.proj /p:Configuration=RelWithDebInfo /p:TargetArchitecture=x86 /t:CreatePackage
-     cd $(Build.SourcesDirectory)\csharp\src\Microsoft.ML.OnnxRuntime\bin\RelWithDebInfo\
+     cd $(Build.BinariesDirectory)\RelWithDebInfo\RelWithDebInfo\
      ren *.nupkg win-x86.zip
-     copy $(Build.SourcesDirectory)\csharp\src\Microsoft.ML.OnnxRuntime\bin\RelWithDebInfo\*zip $(Build.ArtifactStagingDirectory)
+     copy $(Build.BinariesDirectory)\RelWithDebInfo\RelWithDebInfo\*zip $(Build.ArtifactStagingDirectory)
+     mkdir $(Build.ArtifactStagingDirectory)\testdata
+     copy $(Build.BinariesDirectory)\RelWithDebInfo\RelWithDebInfo\custom_op_library.* $(Build.ArtifactStagingDirectory)\testdata
 
 - template: ../../templates/win-ci-arm.yml
   parameters:
-    AgentPool : $(AgentPoolWin)
+    AgentPool : 'Win-CPU-2019'
     JobName: 'Windows_Arm64_Dev'
-    BuildCommand:  '$(Build.SourcesDirectory)\tools\ci_build\build.py --build_dir $(Build.BinariesDirectory) --skip_submodule_sync --cmake_path $(Build.BinariesDirectory)\cmake\bin\cmake.exe --ctest_path $(Build.BinariesDirectory)\cmake\bin\ctest.exe --disable_contrib_ops --enable_msvc_static_runtime --build_shared_lib --arm64'
+    BuildCommand:  '--build_dir $(Build.BinariesDirectory) --skip_submodule_sync --build_shared_lib --cmake_generator "Visual Studio 16 2019" --disable_contrib_ops --disable_ml_ops --enable_msvc_static_runtime --arm64'
     DoDebugBuild: 'false'
     DoNugetPack : 'true'
     DoCompliance: 'false'
@@ -58,43 +64,57 @@ jobs:
      zip -r win10-arm.zip runtimes
      copy *.zip $(Build.ArtifactStagingDirectory)
 
-- template: ../../templates/linux-ci.yml
-  parameters:
-    AgentPool : $(AgentPoolLinux)
-    JobName: 'Linux_CI_Dev'
-    BuildCommand: 'tools/ci_build/github/linux/run_dockerbuild.sh -o ubuntu16.04 -d cpu -r $(Build.BinariesDirectory) -x "--disable_contrib_ops"'
-    DoNugetPack : 'true'
-    ArtifactName: 'drop-linux'
-    NuPackScript: |
-     set -e -x
-     mkdir $(Build.BinariesDirectory)/linux-x64
-     cp $(Build.BinariesDirectory)/Release/libonnxruntime.so $(Build.BinariesDirectory)/linux-x64
-     cd $(Build.BinariesDirectory)
-     zip -r linux-x64.zip linux-x64
-     cp $(Build.BinariesDirectory)/linux*.zip $(Build.ArtifactStagingDirectory)
-     ls -al $(Build.ArtifactStagingDirectory)
-
-- template: ../../templates/linux-ci.yml
-  parameters:
-    AgentPool : $(AgentPoolLinux)
-    JobName: 'Linux_CI_Dev_x86'
-    BuildCommand : 'tools/ci_build/github/linux/run_dockerbuild.sh -o ubuntu16.04 -d cpu -r $(Build.BinariesDirectory) -a x86 -x "--x86 --disable_contrib_ops"'
-    DoNugetPack : 'true'
-    ArtifactName: 'drop-linux-x86'
-    NuPackScript: |
-     set -e -x
-     mkdir $(Build.BinariesDirectory)/linux-x86
-     cp $(Build.BinariesDirectory)/Release/libonnxruntime.so $(Build.BinariesDirectory)/linux-x86
-     cd $(Build.BinariesDirectory)
-     zip -r linux-x86.zip linux-x86
-     cp $(Build.BinariesDirectory)/linux*.zip $(Build.ArtifactStagingDirectory)
-     ls -al $(Build.ArtifactStagingDirectory)
+- job: 'Linux_CI_Dev'
+  workspace:
+    clean: all
+  timeoutInMinutes: 120
+  pool: $(AgentPoolLinux)
+  steps:    
+    - template: ../../templates/set-version-number-variables-step.yml
+    - template: ../../templates/linux-set-variables-and-download.yml
+    - task: Docker@2
+      displayName: login
+      inputs:
+        containerRegistry: onnxruntimeregistry
+        command: login
+        addPipelineData: false
+    - task: CmdLine@2
+      inputs:
+        script: |
+          mkdir -p $HOME/.onnx
+          docker run --rm --volume /data/onnx:/data/onnx:ro --volume $(Build.SourcesDirectory):/onnxruntime_src --volume $(Build.BinariesDirectory):/build --volume /data/models:/build/models:ro --volume $HOME/.onnx:/home/onnxruntimedev/.onnx -e NIGHTLY_BUILD onnxruntimeregistry.azurecr.io/internal/azureml/onnxruntimecentoscpubuild:ch5g /bin/bash -c "python3 /onnxruntime_src/tools/ci_build/build.py --build_dir /build --config Release --skip_submodule_sync --parallel --build_shared_lib --enable_onnx_tests  --disable_contrib_ops --disable_ml_ops && cd /build/Release && make install DESTDIR=/build/linux-x64"
+        workingDirectory: $(Build.SourcesDirectory)
+    - task: Docker@2
+      displayName: logout
+      inputs:
+        containerRegistry: onnxruntimeregistry
+        command: logout
+        addPipelineData: false
+    - script: |
+       set -e -x
+       mv $(Build.BinariesDirectory)/linux-x64/usr/local/lib64 $(Build.BinariesDirectory)/linux-x64/linux-x64
+       cd $(Build.BinariesDirectory)/linux-x64
+       zip -r linux-x64.zip linux-x64
+       cp $(Build.BinariesDirectory)/linux-x64/linux*.zip $(Build.ArtifactStagingDirectory)
+       mkdir $(Build.ArtifactStagingDirectory)/testdata
+       cp $(Build.BinariesDirectory)/Release/libcustom_op_library.so* $(Build.ArtifactStagingDirectory)/testdata 
+       ls -al $(Build.ArtifactStagingDirectory)
+      displayName: 'Create Artifacts'
+    - task: PublishPipelineArtifact@0
+      displayName: 'Publish Pipeline Artifact'
+      inputs:
+        artifactName: 'drop-linux'
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+    - template: ../../templates/component-governance-component-detection-steps.yml
+      parameters :
+        condition : 'succeeded'
+    - template: ../../templates/clean-agent-build-directory-step.yml
 
 - template: ../../templates/mac-ci.yml
   parameters:
     AgentPool : $(AgentPoolMacOS)
     JobName: 'MacOS_CI_Dev'
-    BuildCommand: 'python3 $(Build.SourcesDirectory)/tools/ci_build/build.py --build_dir $(Build.BinariesDirectory) --skip_submodule_sync --parallel --build_shared_lib --disable_contrib_ops --use_openmp --enable_onnx_tests --config RelWithDebInfo'
+    BuildCommand: 'python3 $(Build.SourcesDirectory)/tools/ci_build/build.py --build_dir $(Build.BinariesDirectory) --skip_submodule_sync --parallel --build_shared_lib --disable_contrib_ops --disable_ml_ops --config RelWithDebInfo'
     DoNugetPack : 'true'
     NuPackScript: |
      set -e -x
@@ -108,16 +128,19 @@ jobs:
      cd $(Build.BinariesDirectory)
      zip -r osx-x64.zip osx-x64
      cp $(Build.BinariesDirectory)/osx-x64.zip $(Build.ArtifactStagingDirectory)
+     mkdir $(Build.ArtifactStagingDirectory)/testdata
+     cp $(Build.BinariesDirectory)/RelWithDebInfo/libcustom_op_library.dylib $(Build.ArtifactStagingDirectory)/testdata
      cd $cwd
 
 - job: NuGet_Packaging
-  pool: $(AgentPoolWin)
+  workspace:
+    clean: all
+  pool: 'Win-CPU-2019'
   dependsOn:
   - Windows_CI_Dev
   - Windows_CI_Dev_x86
   - Windows_Arm64_Dev
   - Linux_CI_Dev
-  - Linux_CI_Dev_x86
   - MacOS_CI_Dev
   condition: succeeded()
   steps:
@@ -150,13 +173,6 @@ jobs:
     continueOnError: true
 
   - task: DownloadPipelineArtifact@0
-    displayName: 'Download Pipeline Artifact - Linux-x86'
-    inputs:
-      artifactName: 'drop-linux-x86'
-      targetPath: '$(Build.BinariesDirectory)/nuget-artifact'
-    continueOnError: true
-
-  - task: DownloadPipelineArtifact@0
     displayName: 'Download Pipeline Artifact - MacOS'
     inputs:
       artifactName: 'drop-osx'
@@ -169,50 +185,57 @@ jobs:
      powershell -Command "Invoke-WebRequest http://stahlworks.com/dev/unzip.exe -OutFile unzip.exe"
      powershell -Command "Invoke-WebRequest http://stahlworks.com/dev/zip.exe -OutFile zip.exe"
      set PATH=%CD%;%PATH%
+     SETLOCAL EnableDelayedExpansion
      FOR /R %%i IN (*.nupkg) do (
-         rename %%~ni.nupkg %%~ni.zip
-         unzip %%~ni.zip -d %%~ni
-         del /Q %%~ni.zip
-         unzip win-x86.zip -d win-x86
-         unzip win10-arm.zip -d win10-arm
-         unzip linux-x64.zip -d linux-x64
-         unzip linux-x86.zip -d linux-x86
-         mkdir %%~ni\runtimes\win-x86
-         mkdir %%~ni\runtimes\win10-arm
-         mkdir %%~ni\runtimes\linux-x64
-         mkdir %%~ni\runtimes\linux-x86
-         mkdir %%~ni\runtimes\win-x86\native
-         mkdir %%~ni\runtimes\win10-arm\native
-         mkdir %%~ni\runtimes\linux-x64\native
-         mkdir %%~ni\runtimes\linux-x86\native
-         move win-x86\runtimes\win-x86\native\onnxruntime.dll %%~ni\runtimes\win-x86\native\onnxruntime.dll
-         move win-x86\runtimes\win-x86\native\onnxruntime.lib %%~ni\runtimes\win-x86\native\onnxruntime.lib
-         move win-x86\runtimes\win-x86\native\onnxruntime.pdb %%~ni\runtimes\win-x86\native\onnxruntime.pdb
-         move win10-arm\runtimes\win10-arm\native\onnxruntime.lib %%~ni\runtimes\win10-arm\native\onnxruntime.lib
-         move win10-arm\runtimes\win10-arm\native\onnxruntime.dll %%~ni\runtimes\win10-arm\native\onnxruntime.dll
-         move win10-arm\runtimes\win10-arm\native\onnxruntime.pdb %%~ni\runtimes\win10-arm\native\onnxruntime.pdb
-         move linux-x64\linux-x64\libonnxruntime.so %%~ni\runtimes\linux-x64\native\libonnxruntime.so
-         move linux-x86\linux-x86\libonnxruntime.so %%~ni\runtimes\linux-x86\native\libonnxruntime.so
-         unzip osx-x64.zip -d osx-x64
-         dir osx-x64 /s
-         mkdir %%~ni\runtimes\osx-x64
-         mkdir %%~ni\runtimes\osx-x64\native
-         move osx-x64\osx-x64\libonnxruntime.dylib %%~ni\runtimes\osx-x64\native\libonnxruntime.dylib
-         move osx-x64\osx-x64\libonnxruntime.dylib.dSYM %%~ni\runtimes\osx-x64\native\libonnxruntime.dylib.dSYM
-         pushd %%~ni
-         zip -r ..\%%~ni.zip .
-         popd
-         move %%~ni.zip %%~ni.nupkg
+         set filename=%%~ni
+         IF NOT "!filename:~25,7!"=="Managed" (
+             rename %%~ni.nupkg %%~ni.zip
+             unzip %%~ni.zip -d %%~ni
+             del /Q %%~ni.zip
+             unzip win-x86.zip -d win-x86
+             unzip win10-arm.zip -d win10-arm
+             unzip linux-x64.zip -d linux-x64
+             mkdir %%~ni\runtimes\win-x86
+             mkdir %%~ni\runtimes\win10-arm
+             mkdir %%~ni\runtimes\linux-x64
+             mkdir %%~ni\runtimes\win-x86\native
+             mkdir %%~ni\runtimes\win10-arm\native
+             mkdir %%~ni\runtimes\linux-x64\native
+             move win-x86\runtimes\win-x86\native\onnxruntime.dll %%~ni\runtimes\win-x86\native\onnxruntime.dll
+             move win-x86\runtimes\win-x86\native\onnxruntime.lib %%~ni\runtimes\win-x86\native\onnxruntime.lib
+             move win-x86\runtimes\win-x86\native\onnxruntime.pdb %%~ni\runtimes\win-x86\native\onnxruntime.pdb
+             move win10-arm\runtimes\win10-arm\native\onnxruntime.lib %%~ni\runtimes\win10-arm\native\onnxruntime.lib
+             move win10-arm\runtimes\win10-arm\native\onnxruntime.dll %%~ni\runtimes\win10-arm\native\onnxruntime.dll
+             move win10-arm\runtimes\win10-arm\native\onnxruntime.pdb %%~ni\runtimes\win10-arm\native\onnxruntime.pdb
+             move linux-x64\linux-x64\libonnxruntime.so %%~ni\runtimes\linux-x64\native\libonnxruntime.so
+             unzip osx-x64.zip -d osx-x64
+             dir osx-x64 /s
+             mkdir %%~ni\runtimes\osx-x64
+             mkdir %%~ni\runtimes\osx-x64\native
+             move osx-x64\osx-x64\libonnxruntime.dylib %%~ni\runtimes\osx-x64\native\libonnxruntime.dylib
+             move osx-x64\osx-x64\libonnxruntime.dylib.dSYM %%~ni\runtimes\osx-x64\native\libonnxruntime.dylib.dSYM
+             pushd %%~ni
+             zip -r ..\%%~ni.zip .
+             popd
+             move %%~ni.zip %%~ni.nupkg
+         )
      )
      popd
      copy $(Build.BinariesDirectory)\nuget-artifact\*.nupkg $(Build.ArtifactStagingDirectory)
-    displayName: 'Bundle NuGet and other binaries'
+    displayName: 'Bundle Native NuGet and other binaries'
 
   - template: ../../templates/esrp_nuget.yml
     parameters:
       DisplayName: 'ESRP - sign NuGet package'
       FolderPath: '$(Build.ArtifactStagingDirectory)'
       DoEsrp: ${{ parameters.DoEsrp }}
+
+  - template: ../../templates/validate-nuget.yml
+    parameters:
+      NugetPath: '$(Build.ArtifactStagingDirectory)'
+      NugetPackage: 'Microsoft.ML.OnnxRuntime.*nupkg'
+      PlatformsSupported: 'win-x64,win-x86,win10-arm,linux-x64,osx-x64'
+      VerifyNugetSigning: ${{ parameters.DoEsrp }}
 
   - task: PublishPipelineArtifact@0
     displayName: 'Publish Pipeline NuGet Artifact'

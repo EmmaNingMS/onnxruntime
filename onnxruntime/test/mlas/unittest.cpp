@@ -19,6 +19,7 @@ Abstract:
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <random>
 #include <mlas.h>
 
 #if defined(_WIN32)
@@ -30,17 +31,27 @@ Abstract:
 #include "core/platform/threadpool.h"
 #endif
 
+#include "core/common/make_unique.h"
+
 #if !defined(_countof)
 #define _countof(_Array) (sizeof(_Array) / sizeof(_Array[0]))
 #endif
 
+#if defined(_M_AMD64) || defined(__x86_64__)
+#define MLAS_HAS_DGEMM
+#endif
+
 #if defined(_M_IX86) || defined(__i386__) || defined(_M_AMD64) || defined(__x86_64__)
-#define MLAS_HAS_QGEMM_U8U8
+#define MLAS_HAS_QGEMM_U8X8
+#endif
+
+#if defined(_M_AMD64) || defined(__x86_64__)
+#define MLAS_HAS_PACKED_QGEMM_U8X8
 #endif
 
 MLAS_THREADPOOL* threadpool = nullptr;
 
-template <typename T>
+template<typename T>
 class MatrixGuardBuffer
 {
 public:
@@ -56,7 +67,7 @@ public:
         ReleaseBuffer();
     }
 
-    T* GetBuffer(size_t Elements)
+    T* GetBuffer(size_t Elements, bool ZeroFill = false)
     {
         //
         // Check if the internal buffer needs to be reallocated.
@@ -85,7 +96,7 @@ public:
 #endif
 
             if (_BaseBuffer == nullptr) {
-                throw std::bad_alloc();
+                ORT_THROW_EX(std::bad_alloc);
             }
 
             //
@@ -95,11 +106,11 @@ public:
 
 #if defined(_WIN32)
             if (VirtualAlloc(_BaseBuffer, BytesToAllocate, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
-                throw std::bad_alloc();
+                ORT_THROW_EX(std::bad_alloc);
             }
 #else
             if (mprotect(_BaseBuffer, BytesToAllocate, PROT_READ | PROT_WRITE) != 0) {
-                throw std::bad_alloc();
+                ORT_THROW_EX(std::bad_alloc);
             }
 #endif
 
@@ -114,20 +125,27 @@ public:
         T* GuardAddress = _GuardAddress;
         T* buffer = GuardAddress - Elements;
 
-        const int MinimumFillValue = -23;
-        const int MaximumFillValue = 23;
+        if (ZeroFill) {
 
-        int FillValue = MinimumFillValue;
-        T* FillAddress = buffer;
+            std::fill_n(buffer, Elements, T(0));
 
-        while (FillAddress < GuardAddress) {
+        } else {
 
-            *FillAddress++ = (T)FillValue;
+            const int MinimumFillValue = -23;
+            const int MaximumFillValue = 23;
 
-            FillValue++;
+            int FillValue = MinimumFillValue;
+            T* FillAddress = buffer;
 
-            if (FillValue > MaximumFillValue) {
-                FillValue = MinimumFillValue;
+            while (FillAddress < GuardAddress) {
+
+                *FillAddress++ = (T)FillValue;
+
+                FillValue++;
+
+                if (FillValue > MaximumFillValue) {
+                    FillValue = MinimumFillValue;
+                }
             }
         }
 
@@ -177,7 +195,9 @@ public:
     void
     ExecuteShort(
         void
-        ) = 0;
+        )
+    {
+    }
 
     //
     // Contains tests that can run slowly to more exhaustively test that
@@ -188,10 +208,72 @@ public:
     void
     ExecuteLong(
         void
-        ) = 0;
+        )
+    {
+    }
 };
 
-class MlasSgemmTest : public MlasTestBase
+template<typename T, bool Packed>
+class MlasFgemmTestBase;
+
+template<typename T>
+class MlasFgemmTestBase<T, false> : public MlasTestBase
+{
+public:
+    void
+    TestGemm(
+        CBLAS_TRANSPOSE TransA,
+        CBLAS_TRANSPOSE TransB,
+        size_t M,
+        size_t N,
+        size_t K,
+        float alpha,
+        const T* A,
+        size_t lda,
+        const T* B,
+        size_t ldb,
+        float beta,
+        T* C,
+        size_t ldc
+        )
+    {
+        MlasGemm(TransA, TransB, M, N, K, T(alpha), A, lda, B, ldb, T(beta), C, ldc, threadpool);
+    }
+};
+
+template<typename T>
+class MlasFgemmTestBase<T, true> : public MlasTestBase
+{
+public:
+    void
+    TestGemm(
+        CBLAS_TRANSPOSE TransA,
+        CBLAS_TRANSPOSE TransB,
+        size_t M,
+        size_t N,
+        size_t K,
+        float alpha,
+        const T* A,
+        size_t lda,
+        const T* B,
+        size_t ldb,
+        float beta,
+        T* C,
+        size_t ldc
+        )
+    {
+        size_t PackedBSize = MlasGemmPackBSize(N, K);
+        void* PackedB = BufferBPacked.GetBuffer(PackedBSize, true);
+        MlasGemmPackB(TransB, N, K, B, ldb, PackedB);
+        MlasGemm(TransA, M, N, K, T(alpha), A, lda, PackedB, T(beta), C, ldc, threadpool);
+    }
+
+private:
+    MatrixGuardBuffer<uint8_t> BufferBPacked;
+};
+
+template<typename T, bool Packed>
+class MlasFgemmTest : public MlasFgemmTestBase<T, Packed>
 {
 private:
     void
@@ -203,10 +285,10 @@ private:
         float beta
         )
     {
-        const float* A = BufferA.GetBuffer(K * M);
-        const float* B = BufferB.GetBuffer(N * K);
-        float* C = BufferC.GetBuffer(N * M);
-        float* CReference = BufferCReference.GetBuffer(N * M);
+        const T* A = BufferA.GetBuffer(K * M);
+        const T* B = BufferB.GetBuffer(N * K);
+        T* C = BufferC.GetBuffer(N * M);
+        T* CReference = BufferCReference.GetBuffer(N * M);
 
         Test(CblasNoTrans, CblasNoTrans, M, N, K, alpha, A, K, B, N, beta, C, CReference, N);
         Test(CblasNoTrans, CblasTrans, M, N, K, alpha, A, K, B, K, beta, C, CReference, N);
@@ -222,44 +304,45 @@ private:
         size_t N,
         size_t K,
         float alpha,
-        const float* A,
+        const T* A,
         size_t lda,
-        const float* B,
+        const T* B,
         size_t ldb,
         float beta,
-        float* C,
-        float* CReference,
+        T* C,
+        T* CReference,
         size_t ldc
         )
     {
         std::fill_n(C, M * N, -0.5f);
         std::fill_n(CReference, M * N, -0.5f);
 
-        MlasSgemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, threadpool);
-        ReferenceSgemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, CReference, ldc);
+        this->TestGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        ReferenceGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, CReference, ldc);
 
         for (size_t f = 0; f < M * N; f++) {
             // Sensitive to comparing positive/negative zero.
             if (C[f] != CReference[f]) {
-                printf("mismatch TransA=%d, TransB=%d, M=%zd, N=%zd, K=%zd, alpha=%f, beta=%f!\n", TransA, TransB, M, N, K, alpha, beta);
+                printf("mismatch TransA=%d, TransB=%d, M=%zd, N=%zd, K=%zd, alpha=%f, beta=%f  %f %f!\n", TransA, TransB, M, N, K, alpha, beta, float(C[f]), float(CReference[f]));
+                break;
             }
         }
     }
 
     void
-    ReferenceSgemm(
+    ReferenceGemm(
         CBLAS_TRANSPOSE TransA,
         CBLAS_TRANSPOSE TransB,
         size_t M,
         size_t N,
         size_t K,
         float alpha,
-        const float* A,
+        const T* A,
         size_t lda,
-        const float* B,
+        const T* B,
         size_t ldb,
         float beta,
-        float* C,
+        T* C,
         size_t ldc
         )
     {
@@ -271,10 +354,10 @@ private:
 
                     for (size_t n = 0; n < N; n++) {
 
-                        const float* a = A + (m * lda);
-                        const float* b = B + n;
-                        float* c = C + (m * ldc) + n;
-                        float sum = 0.0f;
+                        const T* a = A + (m * lda);
+                        const T* b = B + n;
+                        T* c = C + (m * ldc) + n;
+                        T sum = 0.0f;
 
                         for (size_t k = 0; k < K; k++) {
                             sum += (*b * *a);
@@ -292,10 +375,10 @@ private:
 
                     for (size_t n = 0; n < N; n++) {
 
-                        const float* a = A + (m * lda);
-                        const float* b = B + (n * ldb);
-                        float* c = C + (m * ldc) + n;
-                        float sum = 0.0f;
+                        const T* a = A + (m * lda);
+                        const T* b = B + (n * ldb);
+                        T* c = C + (m * ldc) + n;
+                        T sum = 0.0f;
 
                         for (size_t k = 0; k < K; k++) {
                             sum += (*b * *a);
@@ -316,10 +399,10 @@ private:
 
                     for (size_t n = 0; n < N; n++) {
 
-                        const float* a = A + m;
-                        const float* b = B + n;
-                        float* c = C + (m * ldc) + n;
-                        float sum = 0.0f;
+                        const T* a = A + m;
+                        const T* b = B + n;
+                        T* c = C + (m * ldc) + n;
+                        T sum = 0.0f;
 
                         for (size_t k = 0; k < K; k++) {
                             sum += (*b * *a);
@@ -337,10 +420,10 @@ private:
 
                     for (size_t n = 0; n < N; n++) {
 
-                        const float* a = A + m;
-                        const float* b = B + (n * ldb);
-                        float* c = C + (m * ldc) + n;
-                        float sum = 0.0f;
+                        const T* a = A + m;
+                        const T* b = B + (n * ldb);
+                        T* c = C + (m * ldc) + n;
+                        T sum = 0.0f;
 
                         for (size_t k = 0; k < K; k++) {
                             sum += (*b * *a);
@@ -355,10 +438,10 @@ private:
         }
     }
 
-    MatrixGuardBuffer<float> BufferA;
-    MatrixGuardBuffer<float> BufferB;
-    MatrixGuardBuffer<float> BufferC;
-    MatrixGuardBuffer<float> BufferCReference;
+    MatrixGuardBuffer<T> BufferA;
+    MatrixGuardBuffer<T> BufferB;
+    MatrixGuardBuffer<T> BufferC;
+    MatrixGuardBuffer<T> BufferCReference;
 
 public:
     void
@@ -375,6 +458,9 @@ public:
         for (size_t b = 256; b < 320; b += 32) {
             Test(b, b, b, 1.0f, 0.0f);
         }
+
+        Test(128, 3072, 768, 1.0f, 0.0f);
+        Test(128, 768, 3072, 1.0f, 0.0f);
     }
 
     void
@@ -389,6 +475,7 @@ public:
                 for (size_t a = 0; a < _countof(multipliers); a++) {
                     for (size_t b = 0; b < _countof(multipliers); b++) {
                         Test(1, N, K, multipliers[a], multipliers[b]);
+                        Test(N, 1, K, multipliers[a], multipliers[b]);
                     }
                 }
             }
@@ -452,9 +539,131 @@ public:
     }
 };
 
-#ifdef MLAS_HAS_QGEMM_U8U8
+#ifdef MLAS_HAS_QGEMM_U8X8
 
-class MlasQgemmU8U8Test : public MlasTestBase
+template<bool Packed>
+class MlasQgemmU8X8U8X8TestBase;
+
+template<>
+class MlasQgemmU8X8U8X8TestBase<false> : public MlasTestBase
+{
+protected:
+    void
+    TestGemm(
+        size_t M,
+        size_t N,
+        size_t K,
+        const uint8_t* A,
+        size_t lda,
+        uint8_t offa,
+        const uint8_t* B,
+        size_t ldb,
+        uint8_t offb,
+        bool BIsSigned,
+        int32_t* C,
+        size_t ldc
+        )
+    {
+        MlasGemm(M, N, K, A, lda, offa, B, ldb, offb, BIsSigned, C, ldc, threadpool);
+    }
+
+    void
+    TestGemm(
+        size_t M,
+        size_t N,
+        size_t K,
+        const uint8_t* A,
+        size_t lda,
+        uint8_t offa,
+        const uint8_t* B,
+        size_t ldb,
+        uint8_t offb,
+        bool BIsSigned,
+        float* C,
+        size_t ldc,
+        float CScale,
+        const float* Bias
+        )
+    {
+        MlasGemm(M, N, K, A, lda, offa, B, ldb, offb, BIsSigned, C, ldc, &CScale, Bias, threadpool);
+    }
+};
+
+#ifdef MLAS_HAS_PACKED_QGEMM_U8X8
+
+template<>
+class MlasQgemmU8X8U8X8TestBase<true> : public MlasTestBase
+{
+private:
+    void*
+    PackB(
+        size_t N,
+        size_t K,
+        const uint8_t* B,
+        size_t ldb,
+        bool BIsSigned
+        )
+    {
+        size_t PackedBSize = MlasGemmPackBSize(N, K, BIsSigned);
+        void* PackedB = BufferBPacked.GetBuffer(PackedBSize);
+        MlasGemmPackB(N, K, B, ldb, BIsSigned, PackedB);
+        return PackedB;
+    }
+
+protected:
+    void
+    TestGemm(
+        size_t M,
+        size_t N,
+        size_t K,
+        const uint8_t* A,
+        size_t lda,
+        uint8_t offa,
+        const uint8_t* B,
+        size_t ldb,
+        uint8_t offb,
+        bool BIsSigned,
+        int32_t* C,
+        size_t ldc
+        )
+    {
+        const void* PackedB = PackB(N, K, B, ldb, BIsSigned);
+        MlasGemm(M, N, K, A, lda, offa, PackedB, offb, BIsSigned, C, ldc, threadpool);
+    }
+
+    void
+    TestGemm(
+        size_t M,
+        size_t N,
+        size_t K,
+        const uint8_t* A,
+        size_t lda,
+        uint8_t offa,
+        const uint8_t* B,
+        size_t ldb,
+        uint8_t offb,
+        bool BIsSigned,
+        float* C,
+        size_t ldc,
+        float CScale,
+        const float* Bias
+        )
+    {
+        const void* PackedB = PackB(N, K, B, ldb, BIsSigned);
+        MlasGemm(M, N, K, A, lda, offa, PackedB, offb, BIsSigned, C, ldc, &CScale, Bias, threadpool);
+    }
+
+private:
+    MatrixGuardBuffer<uint8_t> BufferBPacked;
+};
+
+#endif
+
+template<typename xint8_t, typename OutputType, bool Packed>
+class MlasQgemmU8X8Test;
+
+template<typename xint8_t, bool Packed>
+class MlasQgemmU8X8Test<xint8_t, int32_t, Packed> : public MlasQgemmU8X8U8X8TestBase<Packed>
 {
 private:
     void
@@ -493,12 +702,13 @@ private:
         std::fill_n(C, M * N, -1);
         std::fill_n(CReference, M * N, -1);
 
-        MlasQgemm(M, N, K, A, lda, offa, B, ldb, offb, C, ldc, threadpool);
-        ReferenceQgemm(M, N, K, A, lda, offa, B, ldb, offb, CReference, ldc);
+        this->TestGemm(M, N, K, A, lda, offa, B, ldb, offb, BIsSigned, C, ldc);
+        ReferenceQgemm(M, N, K, A, lda, offa, (const xint8_t*)B, ldb, (xint8_t)offb, CReference, ldc);
 
         for (size_t f = 0; f < M * N; f++) {
             if (C[f] != CReference[f]) {
                 printf("mismatch M=%zd, N=%zd, K=%zd, offa=%d, offb=%d!\n", M, N, K, offa, offb);
+                break;
             }
         }
     }
@@ -511,9 +721,9 @@ private:
         const uint8_t* A,
         size_t lda,
         uint8_t offa,
-        const uint8_t* B,
+        const xint8_t* B,
         size_t ldb,
-        uint8_t offb,
+        xint8_t offb,
         int32_t* C,
         size_t ldc
         )
@@ -523,7 +733,7 @@ private:
             for (size_t n = 0; n < N; n++) {
 
                 const uint8_t* a = A + (m * lda);
-                const uint8_t* b = B + n;
+                const xint8_t* b = B + n;
                 int32_t* c = C + (m * ldc) + n;
                 int32_t sum = 0;
 
@@ -542,6 +752,7 @@ private:
     MatrixGuardBuffer<uint8_t> BufferB;
     MatrixGuardBuffer<int32_t> BufferC;
     MatrixGuardBuffer<int32_t> BufferCReference;
+    const bool BIsSigned = std::is_signed<xint8_t>::value;
 
 public:
     void
@@ -552,12 +763,22 @@ public:
         for (size_t b = 1; b < 16; b++) {
             Test(b, b, b, 14, 211);
         }
+        for (size_t b = 1; b < 16; b++) {
+            Test(b, b, b, 14, 211);
+        }
         for (size_t b = 16; b <= 256; b <<= 1) {
             Test(b, b, b, 34, 1);
         }
         for (size_t b = 256; b < 320; b += 32) {
             Test(b, b, b, 85, 173);
         }
+        for (size_t b = 1; b < 96; b++) {
+            Test(1, b, 32, 0, 0);
+            Test(1, 32, b, 0, 0);
+            Test(1, b, b, 0, 0);
+        }
+        Test(43, 500, 401, 183, 223);
+        Test(1023, 1023, 1023, 5, 8);
     }
 
     void
@@ -565,7 +786,7 @@ public:
         void
         ) override
     {
-        static const uint8_t zero_points[] = { 0, 18, 128, 157, 231, 255 };
+        static const uint8_t zero_points[] = { 0, 18, 75, 128, 157, 231, 255 };
 
         for (size_t a = 0; a < _countof(zero_points); a++) {
             uint8_t offa = zero_points[a];
@@ -622,6 +843,127 @@ public:
             }
             printf("M %zd\n", M);
         }
+    }
+};
+
+template<typename xint8_t, bool Packed>
+class MlasQgemmU8X8Test<xint8_t, float, Packed> : public MlasQgemmU8X8U8X8TestBase<Packed>
+{
+private:
+    void
+    Test(
+        size_t M,
+        size_t N,
+        size_t K,
+        uint8_t offa,
+        uint8_t offb
+        )
+    {
+        const uint8_t* A = BufferA.GetBuffer(K * M);
+        const uint8_t* B = BufferB.GetBuffer(N * K);
+        float* C = BufferC.GetBuffer(N * M);
+        float* CReference = BufferCReference.GetBuffer(N * M);
+        const float* Bias = BufferBias.GetBuffer(N);
+
+        const float AScale = 0.5f;
+        float* AFloat = BufferAFloat.GetBuffer(K * M);
+        DequantizeLinear(A, AFloat, K * M, AScale, offa);
+
+        const float BScale = 0.25f;
+        float* BFloat = BufferBFloat.GetBuffer(N * K);
+        DequantizeLinear((xint8_t*)B, BFloat, N * K, BScale, xint8_t(offb));
+
+        const float CScale = AScale * BScale;
+
+        Test(M, N, K, A, AFloat, K, offa, B, BFloat, N, offb, C, CReference, N, CScale, nullptr);
+        Test(M, N, K, A, AFloat, K, offa, B, BFloat, N, offb, C, CReference, N, CScale, Bias);
+    }
+
+    void
+    Test(
+        size_t M,
+        size_t N,
+        size_t K,
+        const uint8_t* A,
+        const float* AFloat,
+        size_t lda,
+        uint8_t offa,
+        const uint8_t* B,
+        const float* BFloat,
+        size_t ldb,
+        uint8_t offb,
+        float* C,
+        float* CReference,
+        size_t ldc,
+        float CScale,
+        const float* Bias
+        )
+    {
+        MlasGemm(CblasNoTrans, CblasNoTrans, M, N, K, 1.0f, AFloat, lda, BFloat, ldb, 0.0f, CReference, ldc, threadpool);
+
+        if (Bias != nullptr) {
+            for (size_t m = 0; m < M; m++) {
+                for (size_t n = 0; n < N; n++) {
+                    CReference[m * ldc + n] += Bias[n];
+                }
+            }
+        }
+
+        this->TestGemm(M, N, K, A, lda, offa, B, ldb, offb, BIsSigned, C, ldc, CScale, Bias);
+
+        for (size_t f = 0; f < M * N; f++) {
+            // Sensitive to comparing positive/negative zero.
+            if (C[f] != CReference[f]) {
+                printf("mismatch M=%zd, N=%zd, K=%zd, offa=%d, offb=%d! %f %f\n", M, N, K, offa, offb, C[f], CReference[f]);
+                break;
+            }
+        }
+    }
+
+    template<typename qint8_t>
+    void
+    DequantizeLinear(
+        const qint8_t* Input,
+        float* Output,
+        size_t N,
+        float scale,
+        qint8_t offset
+        )
+    {
+        for (size_t n = 0; n < N; n++) {
+            Output[n] = float((int32_t(Input[n]) - offset)) * scale;
+        }
+    }
+
+    MatrixGuardBuffer<uint8_t> BufferA;
+    MatrixGuardBuffer<uint8_t> BufferB;
+    MatrixGuardBuffer<float> BufferAFloat;
+    MatrixGuardBuffer<float> BufferBFloat;
+    MatrixGuardBuffer<float> BufferC;
+    MatrixGuardBuffer<float> BufferCReference;
+    MatrixGuardBuffer<float> BufferBias;
+    const bool BIsSigned = std::is_signed<xint8_t>::value;
+
+public:
+    void
+    ExecuteShort(
+        void
+        ) override
+    {
+        for (size_t b = 1; b < 16; b++) {
+            Test(b, b, b, 34, 46);
+        }
+        for (size_t b = 16; b <= 256; b <<= 1) {
+            Test(b, b, b, 15, 191);
+        }
+        for (size_t b = 256; b < 320; b += 32) {
+            Test(b, b, b, 223, 73);
+        }
+        for (size_t b = 1; b < 96; b++) {
+            Test(1, b, 32, 0, 0);
+        }
+        Test(43, 503, 401, 183, 223);
+        Test(1024, 1024, 256, 13, 15);
     }
 };
 
@@ -851,7 +1193,7 @@ protected:
                     Input += InputSize;
                 }
 
-                MlasSgemm(CblasNoTrans, CblasNoTrans, FilterCount, OutputSize, K, 1.0f,
+                MlasGemm(CblasNoTrans, CblasNoTrans, FilterCount, OutputSize, K, 1.0f,
                     filter, K, Im2Col, OutputSize, 0.0f, Output, OutputSize, threadpool);
 
                 //
@@ -1067,8 +1409,7 @@ protected:
         MLAS_ACTIVATION Activation;
         Activation.ActivationKind = MlasIdentityActivation;
 
-        MlasNchwcConv(2,
-                      InputShape,
+        MlasNchwcConv(InputShape,
                       KernelShape,
                       DilationShape,
                       Padding,
@@ -1087,7 +1428,7 @@ protected:
         // Reorder the output buffer.
         //
 
-        MlasReorderOutput(OutputShape, NchwcOutput, Output);
+        MlasReorderOutputNchw(OutputShape, NchwcOutput, Output);
     }
 
     const size_t BlockSize = MlasNchwcGetBlockSize();
@@ -1485,7 +1826,6 @@ protected:
         MlasReorderInput(InputShape, Input, NchwcInput);
 
         MlasNchwcPool(PoolingKind,
-                      2,
                       NchwcInputShape,
                       KernelShape,
                       nullptr,
@@ -1496,7 +1836,7 @@ protected:
                       NchwcOutput,
                       nullptr);
 
-        MlasReorderOutput(OutputShape, NchwcOutput, Output);
+        MlasReorderOutputNchw(OutputShape, NchwcOutput, Output);
     }
 
     MatrixGuardBuffer<float> BufferNchwcInput;
@@ -1923,12 +2263,12 @@ public:
                 Buffer[i].u = TestData[i][0].u;
             }
 
-            MlasActivation(&Activation, &Buffer[0].f, nullptr, _countof(Buffer), 1, 1);
+            MlasActivation(&Activation, &Buffer[0].f, nullptr, 1, _countof(Buffer), _countof(Buffer));
 
             for (unsigned i = 0; i < _countof(TestData); i++) {
                 // Sensitive to comparing positive/negative zero and NaNs.
                 if (Buffer[i].u != TestData[i][kind].u && Buffer[i].f != TestData[i][kind].f) {
-                    printf("mismatch activation kind=%d i=%d value=%08x expected=%08x\n", kind, i, Buffer[i].u, TestData[i][kind].u);
+                    printf("mismatch activation kind=%d i=%d value=%08x expected=%08x\n", (int)kind, (int)i, Buffer[i].u, TestData[i][kind].u);
                 }
             }
 
@@ -1944,19 +2284,548 @@ public:
             for (unsigned i = 0; i < _countof(TestData); i++) {
                 // Sensitive to comparing positive/negative zero and NaNs.
                 if (Buffer[i].u != TestData[i][kind].u && Buffer[i].f != TestData[i][kind].f) {
-                    printf("mismatch activation kind=%d i=%d value=%08x expected=%08x\n", kind, i, Buffer[i].u, TestData[i][kind].u);
+                    printf("mismatch activation kind=%d i=%d value=%08x expected=%08x\n", (int)kind, (int)i, Buffer[i].u, TestData[i][kind].u);
                 }
+            }
+        }
+    }
+};
+
+class MlasReorderOutputTest : public MlasTestBase
+{
+private:
+    const size_t BlockSize = MlasNchwcGetBlockSize();
+
+    MatrixGuardBuffer<float> BufferInput;
+    MatrixGuardBuffer<float> BufferOutput;
+    MatrixGuardBuffer<float> BufferOutput2;
+    MatrixGuardBuffer<float> BufferOutputReference;
+
+    void
+    Test(
+        size_t BatchCount,
+        size_t Channels,
+        size_t Height,
+        size_t Width
+        )
+    {
+        size_t NchwcChannels = (Channels + BlockSize - 1) & ~(BlockSize - 1);
+
+        size_t InputBufferElements = BatchCount * NchwcChannels * Height * Width;
+        size_t OutputBufferElements = BatchCount * Channels * Height * Width;
+
+        const float* Input = BufferInput.GetBuffer(InputBufferElements);
+        float* Output = BufferOutput.GetBuffer(OutputBufferElements);
+        float* OutputReference = BufferOutputReference.GetBuffer(OutputBufferElements);
+
+        int64_t NchwOutputShape[] = { int64_t(BatchCount), int64_t(Channels), int64_t(Height), int64_t(Width) };
+
+        std::fill_n(Output, OutputBufferElements, -0.5f);
+        std::fill_n(OutputReference, OutputBufferElements, -0.5f);
+
+        MlasReorderOutputNchw(NchwOutputShape, Input, Output);
+        ReferenceReorderOutput(BatchCount, Channels, Height, Width, Input, OutputReference, false);
+
+        if (memcmp(Output, OutputReference, OutputBufferElements * sizeof(float)) != 0) {
+            printf("mismatch ReorderOutputNchw: batch=%zd channels=%zd height=%zd width=%zd\n",
+                BatchCount, Channels, Height, Width);
+        }
+
+        int64_t NhwcOutputShape[] = { int64_t(BatchCount), int64_t(Height), int64_t(Width), int64_t(Channels) };
+
+        std::fill_n(Output, OutputBufferElements, -0.5f);
+        std::fill_n(OutputReference, OutputBufferElements, -0.5f);
+
+        MlasReorderOutputNhwc(NhwcOutputShape, Input, Output);
+        ReferenceReorderOutput(BatchCount, Channels, Height, Width, Input, OutputReference, true);
+
+        if (memcmp(Output, OutputReference, OutputBufferElements * sizeof(float)) != 0) {
+            printf("mismatch ReorderOutputNhwc: batch=%zd channels=%zd height=%zd width=%zd\n",
+                BatchCount, Channels, Height, Width);
+        }
+    }
+
+    void
+    ReferenceReorderOutput(
+        size_t BatchCount,
+        size_t Channels,
+        size_t Height,
+        size_t Width,
+        const float* Input,
+        float* Output,
+        bool NhwcFormat
+        )
+    {
+        size_t NchwcChannels = (Channels + (BlockSize - 1)) & ~(BlockSize - 1);
+        size_t SpatialSize = Height * Width;
+
+        size_t ChannelStride = NhwcFormat ? 1 : SpatialSize;
+        size_t SpatialStride = NhwcFormat ? Channels : 1;
+
+        for (size_t n = 0; n < BatchCount; n++) {
+
+            for (size_t c = 0; c < Channels; c++) {
+
+                const float* input = Input + ((c & ~(BlockSize - 1)) * SpatialSize) + (c & (BlockSize - 1));
+                float* output = Output + (c * ChannelStride);
+
+                for (size_t hw = 0; hw < SpatialSize; hw++) {
+                    output[hw * SpatialStride] = input[hw * BlockSize];
+                }
+            }
+
+            Input += NchwcChannels * SpatialSize;
+            Output += Channels * SpatialSize;
+        }
+    }
+
+public:
+    void
+    ExecuteShort(
+        void
+        ) override
+    {
+        for (size_t c = 1; c < 48; c++) {
+            Test(1, c, 112, 112);
+            Test(4, c, 15, 21);
+            Test(16, c, 11, 11);
+        }
+    }
+};
+
+class MlasSoftmaxTest : public MlasTestBase
+{
+private:
+    MatrixGuardBuffer<float> BufferInput;
+    MatrixGuardBuffer<float> BufferOutput;
+    MatrixGuardBuffer<float> BufferOutputReference;
+
+    void
+    Test(
+        size_t N,
+        size_t D,
+        float MinimumValue,
+        float MaximumValue
+        )
+    {
+        float* Input = BufferInput.GetBuffer(N * D);
+        float* Output = BufferOutput.GetBuffer(N * D);
+        float* OutputReference = BufferOutputReference.GetBuffer(N * D);
+
+        std::default_random_engine generator(static_cast<unsigned>(N * D));
+        std::uniform_real_distribution<float> distribution(MinimumValue, MaximumValue);
+
+        for (size_t nd = 0; nd < N * D; nd++) {
+            Input[nd] = distribution(generator);
+        }
+
+        Test(Input, Output, OutputReference, N, D, false);
+        Test(Input, Output, OutputReference, N, D, true);
+    }
+
+    void
+    Test(
+        const float* Input,
+        float* Output,
+        float* OutputReference,
+        size_t N,
+        size_t D,
+        bool LogSoftmax
+        )
+    {
+        MlasComputeSoftmax(Input, Output, N, D, LogSoftmax, threadpool);
+        ReferenceSoftmax(Input, OutputReference, N, D, LogSoftmax);
+
+        constexpr float AbsoluteTolerance = 1e-6f;
+        constexpr float RelativeTolerance = 1e-6f;
+
+        for (size_t nd = 0; nd < N * D; nd++) {
+            float diff = std::fabs(Output[nd] - OutputReference[nd]);
+            if (diff > AbsoluteTolerance && diff > std::fabs(OutputReference[nd]) * RelativeTolerance) {
+                printf("softmax(%d) difference: %u/%u %.8f %.8f\n", int32_t(LogSoftmax), unsigned(N), unsigned(D), Output[nd], OutputReference[nd]);
             }
         }
     }
 
     void
-    ExecuteLong(
+    ReferenceSoftmax(
+        const float* Input,
+        float* Output,
+        size_t N,
+        size_t D,
+        bool LogSoftmax
+        )
+    {
+        for (size_t n = 0; n < N; n++) {
+
+            float MaximumValue = std::numeric_limits<float>::lowest();
+
+            for (size_t d = 0; d < D; d++) {
+                MaximumValue = (std::max)(MaximumValue, Input[d]);
+            }
+
+            double Sum = 0.0;
+
+            for (size_t d = 0; d < D; d++) {
+                double e = std::exp(double(Input[d]) - double(MaximumValue));
+                Sum += e;
+                Output[d] = float(e);
+            }
+
+            if (LogSoftmax) {
+
+                float Scale = float(std::log(Sum));
+
+                for (size_t d = 0; d < D; d++) {
+                    Output[d] = Input[d] - MaximumValue - Scale;
+                }
+
+            } else {
+
+                float Scale = float(Sum);
+
+                for (size_t d = 0; d < D; d++) {
+                    Output[d] /= Scale;
+                }
+            }
+
+            Input += D;
+            Output += D;
+        }
+    }
+
+public:
+    void
+    ExecuteShort(
         void
         ) override
     {
+        for (size_t d = 1; d < 128; d++) {
+            Test(1, d, -10.f, 10.f);
+        }
+
+        Test(3, 128, 20.f, 30.f);
+        Test(63, 95, -150.f, 190.f);
+        Test(16, 211, 20.f, 30.f);
     }
 };
+
+class MlasComputeExpTest : public MlasTestBase
+{
+private:
+    MatrixGuardBuffer<float> BufferInput;
+    MatrixGuardBuffer<float> BufferOutput;
+    MatrixGuardBuffer<float> BufferOutputReference;
+
+    void
+    Test(
+        size_t N,
+        float MinimumValue,
+        float MaximumValue
+        )
+    {
+        float* Input = BufferInput.GetBuffer(N);
+        float* Output = BufferOutput.GetBuffer(N);
+        float* OutputReference = BufferOutputReference.GetBuffer(N);
+
+        std::default_random_engine generator(static_cast<unsigned>(N));
+        std::uniform_real_distribution<float> distribution(MinimumValue, MaximumValue);
+
+        for (size_t n = 0; n < N; n++) {
+            Input[n] = distribution(generator);
+        }
+
+        for (size_t n = 0; n < N; n++) {
+            OutputReference[n] = std::exp(Input[n]);
+        }
+
+        MlasComputeExp(Input, Output, N);
+
+        constexpr float AbsoluteTolerance = 1e-6f;
+        constexpr float RelativeTolerance = 1e-6f;
+
+        for (size_t n = 0; n < N; n++) {
+            float diff = std::fabs(Output[n] - OutputReference[n]);
+            if (diff > AbsoluteTolerance && diff > std::fabs(OutputReference[n]) * RelativeTolerance) {
+                printf("exp difference: %u %.8f %.8f\n", unsigned(N), Output[n], OutputReference[n]);
+            }
+        }
+    }
+
+public:
+    void
+    ExecuteShort(
+        void
+        ) override
+    {
+        for (size_t n = 1; n < 128; n++) {
+            Test(n, -10.f, 10.f);
+        }
+    }
+};
+
+class MlasQLinearBinaryOpTest : public MlasTestBase
+{
+public:
+    typedef void (MLASCALL *QLinearBinaryOpS8)(
+                const int8_t* InputA, float ScaleA, int32_t ZeroPointA,
+                const int8_t* InputB, float ScaleB, int32_t ZeroPointB,
+                float ScaleC, int32_t ZeroPointC, int8_t* OutputC,
+                size_t N, bool IsScalarB);
+    typedef void (MLASCALL *QLinearBinaryOpU8)(
+                const uint8_t* InputA, float ScaleA, int32_t ZeroPointA,
+                const uint8_t* InputB, float ScaleB, int32_t ZeroPointB,
+                float ScaleC, int32_t ZeroPointC, uint8_t* OutputC,
+                size_t N, bool IsScalarB);
+
+private:
+    std::function<float(float, float)> ScalarOp;
+    std::string ScalarOpName;
+    QLinearBinaryOpS8 QLinearS8Op;
+    QLinearBinaryOpU8 QLinearU8Op;
+    MatrixGuardBuffer<uint8_t> BufferInputA;
+    MatrixGuardBuffer<uint8_t> BufferInputB;
+    MatrixGuardBuffer<uint8_t> BufferOutput;
+    MatrixGuardBuffer<uint8_t> BufferOutputReference;
+
+    template <typename T>
+    T
+    QLinearBinaryScalar(
+        T a,
+        float ScaleA,
+        int32_t ZeroPointA,
+        T b,
+        float ScaleB,
+        int32_t ZeroPointB,
+        float ScaleC,
+        int32_t ZeroPointC
+        )
+    {
+        constexpr int qmax = std::numeric_limits<T>::max();
+        constexpr int qmin = std::numeric_limits<T>::min();
+
+        float ValueA = ScaleA * (static_cast<int>(a) - ZeroPointA);
+        float ValueB = ScaleB * (static_cast<int>(b) - ZeroPointB);
+        float ValueC = std::nearbyintf(ScalarOp(ValueA, ValueB) / ScaleC) + ZeroPointC;
+        int qc = static_cast<int>(ValueC);
+        qc = std::min(qc, qmax);
+        qc = std::max(qc, qmin);
+        return static_cast<T>(qc);
+    }
+
+    template <typename T>
+    void
+    Test(
+        void (MLASCALL *QLinearBinaryOp)(
+                const T* InputA, float ScaleA, int32_t ZeroPointA,
+                const T* InputB, float ScaleB, int32_t ZeroPointB,
+                float ScaleC, int32_t ZeroPointC, T* OutputC,
+                size_t N, bool IsScalarB),
+        size_t N,
+        bool IsScalarB,
+        float ScaleA,
+        int32_t ZeroPointA,
+        float ScaleB,
+        int32_t ZeroPointB,
+        float ScaleC,
+        int32_t ZeroPointC
+        )
+    {
+        T* InputA = (T*)BufferInputA.GetBuffer(N);
+        T* InputB = (T*)BufferInputB.GetBuffer(IsScalarB ? 1 : N);
+        T* OutputC = (T*)BufferOutput.GetBuffer(N);
+        T* OutputReference = (T*)BufferOutputReference.GetBuffer(N);
+
+        constexpr int MinimumValue = (int)std::numeric_limits<T>::min();
+        constexpr int MaximumValue = (int)std::numeric_limits<T>::max();
+        std::default_random_engine generator(static_cast<unsigned>(N));
+        std::uniform_int_distribution<int> distribution(MinimumValue, MaximumValue);
+
+        if (IsScalarB) {
+            InputB[0] = static_cast<T>(distribution(generator));
+        }
+        for (size_t n = 0; n < N; n++) {
+            InputA[n] = static_cast<T>(distribution(generator));
+            if (!IsScalarB) {
+                InputB[n] = static_cast<T>(distribution(generator));
+            }
+            OutputReference[n] = QLinearBinaryScalar(InputA[n], ScaleA, ZeroPointA, InputB[IsScalarB ? 0 : n], ScaleB, ZeroPointB, ScaleC, ZeroPointC);
+        }
+
+        QLinearBinaryOp(InputA, ScaleA, ZeroPointA, InputB, ScaleB, ZeroPointB, ScaleC, ZeroPointC, OutputC, N, IsScalarB);
+
+        for (size_t n = 0; n < N; n++) {
+            int diff = (int)OutputC[n] - (int)OutputReference[n];
+            if (diff < -1 || diff > 1) {
+                printf("Test IsScalarB=%d difference @%u of %u, %d(%f,%d) %s %d(%f,%d) => %d(%f,%d) (expecting %d)\n",
+                        int(IsScalarB), static_cast<unsigned>(n), static_cast<unsigned>(N),
+                        static_cast<int>(InputA[n]), ScaleA, ZeroPointA,
+                        ScalarOpName.c_str(),
+                        static_cast<int>(InputB[IsScalarB ? 0 : n]), ScaleB, ZeroPointB,
+                        static_cast<int>(OutputC[n]), ScaleC, ZeroPointC,
+                        static_cast<int>(OutputReference[n]));
+            }
+        }
+    }
+
+public:
+    explicit MlasQLinearBinaryOpTest(
+        std::function<float(float, float)> P_ScalarOp,
+        const std::string& P_ScalarOpName,
+        QLinearBinaryOpS8 P_QLinearS8Op,
+        QLinearBinaryOpU8 P_QLinearU8Op
+        )
+        : ScalarOp(P_ScalarOp),
+          ScalarOpName(P_ScalarOpName),
+          QLinearS8Op(P_QLinearS8Op),
+          QLinearU8Op(P_QLinearU8Op)
+    {
+    }
+
+    void
+    ExecuteShort(
+        void
+        ) override
+    {
+        static const uint8_t zero_points[] = { 0, 18, 75, 128, 157, 231, 255 };
+        static const float c_scales[] = { 18.0f, 90.0f };
+
+        const int8_t* s_zero_points = (const int8_t*)(&zero_points[0]);
+        for (size_t a = 0; a < _countof(zero_points); a++) {
+            for (size_t b = 0; b < _countof(zero_points); b++) {
+                for (size_t c = 0; c < _countof(zero_points); c++) {
+                    for (size_t s = 0; s < _countof(c_scales); s++) {
+                        for (size_t n = 1; n < 128; n++) {
+                            // u8, vector + vector
+                            Test<uint8_t>(QLinearU8Op, n, false, 10.f, zero_points[a], 10.f, zero_points[b], c_scales[s], zero_points[c]);
+
+                            // u8, vector + scalar
+                            Test<uint8_t>(QLinearU8Op, n, true, 10.f, zero_points[a], 10.f, zero_points[b], c_scales[s], zero_points[c]);
+
+                            // s8, vector + vector
+                            Test<int8_t>(QLinearS8Op, n, false, 10.f, s_zero_points[a], 10.f, s_zero_points[b], c_scales[s], s_zero_points[c]);
+
+                            // s8, vector + scalar
+                            Test<int8_t>(QLinearS8Op, n, true, 10.f, s_zero_points[a], 10.f, s_zero_points[b], c_scales[s], s_zero_points[c]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+};
+
+class MlasFindMinMaxElementsTest : public MlasTestBase
+{
+private:
+    MatrixGuardBuffer<float> BufferInput;
+
+    void
+    Test(
+        size_t N,
+        float MinimumValue,
+        float MaximumValue
+        )
+    {
+        float* Input = BufferInput.GetBuffer(N);
+
+        std::default_random_engine generator(static_cast<unsigned>(N));
+        std::uniform_real_distribution<float> distribution(MinimumValue, MaximumValue);
+
+        for (size_t n = 0; n < N; n++) {
+            Input[n] = distribution(generator);
+        }
+
+        auto min_max_pair = std::minmax_element(Input, Input + N);
+        float min_ref = *min_max_pair.first;
+        float max_ref = *min_max_pair.second;
+
+        float min, max;
+        MlasFindMinMaxElement(Input, &min, &max, N);
+
+        constexpr float epsilon = 1e-6f;
+
+        float diff_min = std::fabs(min - min_ref);
+        if (diff_min > epsilon) {
+            printf("minimum difference: %.8f %.8f\n", min, min_ref);
+        }
+
+        float diff_max = std::fabs(max - max_ref);
+        if (diff_max > epsilon) {
+            printf("maximum difference: %.8f %.8f\n", max, max_ref);
+        }
+    }
+
+public:
+    void
+    ExecuteShort(
+        void
+        ) override
+    {
+        for (size_t n = 1; n < 128; n++) {
+            Test(n, -10.f, 10.f);
+        }
+    }
+};
+
+void
+RunThreadedTests(
+    void
+    )
+{
+    printf("SGEMM tests.\n");
+    onnxruntime::make_unique<MlasFgemmTest<float, false>>()->ExecuteShort();
+    printf("SGEMM packed tests.\n");
+    onnxruntime::make_unique<MlasFgemmTest<float, true>>()->ExecuteShort();
+#ifdef MLAS_HAS_DGEMM
+    printf("DGEMM tests.\n");
+    onnxruntime::make_unique<MlasFgemmTest<double, false>>()->ExecuteShort();
+#endif
+
+#ifdef MLAS_HAS_QGEMM_U8X8
+    printf("QGEMM U8S8=int32_t tests.\n");
+    onnxruntime::make_unique<MlasQgemmU8X8Test<int8_t, int32_t, false>>()->ExecuteShort();
+    printf("QGEMM U8S8=float tests.\n");
+    onnxruntime::make_unique<MlasQgemmU8X8Test<int8_t, float, false>>()->ExecuteShort();
+    printf("QGEMM U8U8=int32_t tests.\n");
+    onnxruntime::make_unique<MlasQgemmU8X8Test<uint8_t, int32_t, false>>()->ExecuteShort();
+    printf("QGEMM U8U8=float tests.\n");
+    onnxruntime::make_unique<MlasQgemmU8X8Test<uint8_t, float, false>>()->ExecuteShort();
+#endif
+
+#ifdef MLAS_HAS_PACKED_QGEMM_U8X8
+    if (MlasGemmPackBSize(128, 128, true) > 0) {
+        printf("QGEMM U8S8=int32_t packed tests.\n");
+        onnxruntime::make_unique<MlasQgemmU8X8Test<int8_t, int32_t, true>>()->ExecuteShort();
+        printf("QGEMM U8S8=float packed tests.\n");
+        onnxruntime::make_unique<MlasQgemmU8X8Test<int8_t, float, true>>()->ExecuteShort();
+    }
+    if (MlasGemmPackBSize(128, 128, false) > 0) {
+        printf("QGEMM U8U8=int32_t packed tests.\n");
+        onnxruntime::make_unique<MlasQgemmU8X8Test<uint8_t, int32_t, true>>()->ExecuteShort();
+        printf("QGEMM U8U8=float packed tests.\n");
+        onnxruntime::make_unique<MlasQgemmU8X8Test<uint8_t, float, true>>()->ExecuteShort();
+    }
+#endif
+
+    printf("Conv2D tests.\n");
+    onnxruntime::make_unique<MlasConv2DTest>()->ExecuteShort();
+    if (MlasNchwcGetBlockSize() > 1) {
+        onnxruntime::make_unique<MlasNchwcConv2DTest>()->ExecuteShort();
+    }
+
+    printf("Pool2D tests.\n");
+    onnxruntime::make_unique<MlasPool2DTest>()->ExecuteShort();
+    if (MlasNchwcGetBlockSize() > 1) {
+        onnxruntime::make_unique<MlasNchwcPool2DTest>()->ExecuteShort();
+    }
+
+    printf("Pool3D tests.\n");
+    onnxruntime::make_unique<MlasPool3DTest>()->ExecuteShort();
+
+    printf("Softmax tests.\n");
+    onnxruntime::make_unique<MlasSoftmaxTest>()->ExecuteShort();
+}
 
 int
 #if defined(_WIN32)
@@ -1966,42 +2835,54 @@ main(
     void
     )
 {
-    for (int i = 0; i != 2; ++i) {
-        printf("SGEMM tests.\n");
-        std::make_unique<MlasSgemmTest>()->ExecuteShort();
+    //
+    // Run threaded tests without the thread pool.
+    //
 
-#ifdef MLAS_HAS_QGEMM_U8U8
-        printf("QGEMM tests.\n");
-        std::make_unique<MlasQgemmU8U8Test>()->ExecuteShort();
-#endif
+    RunThreadedTests();
 
-        printf("Conv2D tests.\n");
-        std::make_unique<MlasConv2DTest>()->ExecuteShort();
-        if (MlasNchwcGetBlockSize() > 1) {
-            std::make_unique<MlasNchwcConv2DTest>()->ExecuteShort();
-        }
-
-        printf("Pool2D tests.\n");
-        std::make_unique<MlasPool2DTest>()->ExecuteShort();
-        if (MlasNchwcGetBlockSize() > 1) {
-            std::make_unique<MlasNchwcPool2DTest>()->ExecuteShort();
-        }
-
-        printf("Pool3D tests.\n");
-        std::make_unique<MlasPool3DTest>()->ExecuteShort();
-
-        printf("Activation tests.\n");
-        std::make_unique<MlasActivationTest>()->ExecuteShort();
-
-        printf("Done.\n");
 #if !defined(MLAS_NO_ONNXRUNTIME_THREADPOOL)
-        if(threadpool != nullptr) threadpool = new onnxruntime::concurrency::ThreadPool("test", 2);
-#else
-        break;
-#endif
-	}
-#if !defined(MLAS_NO_ONNXRUNTIME_THREADPOOL)
+
+    //
+    // Run threaded tests using the thread pool.
+    //
+
+    threadpool = new onnxruntime::concurrency::ThreadPool(
+        &onnxruntime::Env::Default(), onnxruntime::ThreadOptions(), nullptr, 2, true);
+
+    RunThreadedTests();
+
     delete threadpool;
+
 #endif
+
+    //
+    // Run remaining tests that do not use the thread pool.
+    //
+
+    printf("Activation tests.\n");
+    onnxruntime::make_unique<MlasActivationTest>()->ExecuteShort();
+
+    printf("Transcendental tests.\n");
+    onnxruntime::make_unique<MlasComputeExpTest>()->ExecuteShort();
+
+    printf("MinMaxElements tests.\n");
+    onnxruntime::make_unique<MlasFindMinMaxElementsTest>()->ExecuteShort();
+
+    printf("ReorderOutput tests.\n");
+    if (MlasNchwcGetBlockSize() > 1) {
+        onnxruntime::make_unique<MlasReorderOutputTest>()->ExecuteShort();
+    }
+
+    printf("QLinearAdd tests.\n");
+    onnxruntime::make_unique<MlasQLinearBinaryOpTest>(
+        [](float a, float b) { return a + b; }, "+", MlasQLinearAdd<int8_t>, MlasQLinearAdd<uint8_t>)->ExecuteShort();
+
+    printf("QLinearMul tests.\n");
+    onnxruntime::make_unique<MlasQLinearBinaryOpTest>(
+        [] (float a, float b) { return a * b; }, "*", MlasQLinearMul<int8_t>, MlasQLinearMul<uint8_t>)->ExecuteShort();
+
+    printf("Done.\n");
+
     return 0;
 }

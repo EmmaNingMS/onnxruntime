@@ -4,7 +4,8 @@
 #include "core/framework/tensor_shape.h"
 #include <iostream>
 #include "core/common/common.h"
-#include "core/graph/onnx_protobuf.h"
+#include "core/common/safeint.h"
+#include "core/framework/tensorprotoutils.h"
 
 namespace onnxruntime {
 
@@ -80,7 +81,7 @@ std::string TensorShape::ToString() const {
 
 int64_t TensorShape::SizeHelper(size_t start, size_t end) const {
   // Must return 1 for an empty sequence
-  int64_t size = 1;
+  SafeInt<int64_t> size = 1;  // this is used to calculate the size, which is used for memory allocations, so validate no overflow
   for (size_t i = start; i < end; i++) {
     if ((*this)[i] < 0) return -1;
     size *= (*this)[i];
@@ -91,29 +92,6 @@ int64_t TensorShape::SizeHelper(size_t start, size_t end) const {
 // operator<< to nicely output to a stream
 std::ostream& operator<<(std::ostream& out, const ::onnxruntime::TensorShape& shape) {
   return (out << shape.ToString());
-}
-
-std::ostream& operator<<(std::ostream& out, const ONNX_NAMESPACE::TensorShapeProto& shape_proto) {
-  std::string result;
-  result.reserve(128);
-
-  result.append("{");
-  bool first = true;
-  for (auto& dim : shape_proto.dim()) {
-    if (!first) {
-      result.append(",");
-    }
-
-    if (dim.has_dim_value())
-      result.append(std::to_string(dim.dim_value()));
-    else if (dim.has_dim_param())
-      result.append(dim.dim_param());
-
-    first = false;
-  }
-  result.append("}");
-
-  return (out << result);
 }
 
 }  // namespace onnxruntime

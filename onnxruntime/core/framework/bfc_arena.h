@@ -25,6 +25,7 @@ limitations under the License.
 #include "core/common/logging/severity.h"
 #include "core/platform/ort_mutex.h"
 #include "core/framework/arena.h"
+#include "core/common/safeint.h"
 #include "onnxruntime_config.h"
 
 #if defined(PLATFORM_WINDOWS)
@@ -38,39 +39,9 @@ namespace onnxruntime {
 #endif
 #endif
 
-// Runtime statistics collected by an allocator.
-struct AllocatorStats {
-  int64_t num_allocs;             // Number of allocations.
-  int64_t bytes_in_use;           // Number of bytes in use.
-  int64_t total_allocated_bytes;  // The total number of allocated bytes by the allocator.
-  int64_t max_bytes_in_use;       // The maximum bytes in use.
-  int64_t max_alloc_size;         // The max single allocation seen.
-                                  // The upper limit what the allocator can allocate, if such a limit
-                                  // is known. Certain allocator may return 0 to indicate the limit is
-                                  // unknown.
-  int64_t bytes_limit;
-
-  AllocatorStats() { Clear(); }
-
-  void Clear() {
-    this->num_allocs = 0;
-    this->bytes_in_use = 0;
-    this->max_bytes_in_use = 0;
-    this->max_alloc_size = 0;
-    this->bytes_limit = 0;
-    this->total_allocated_bytes = 0;
-  }
-
-  std::string DebugString() const {
-    std::ostringstream ss;
-    ss << "Limit:           " << this->bytes_limit << "\n"
-       << "InUse:          " << this->bytes_in_use << "\n"
-       << "TotalAllocated: " << this->total_allocated_bytes << "\n"
-       << "MaxInUse:       " << this->max_bytes_in_use << "\n"
-       << "NumAllocs:      " << this->num_allocs << "\n"
-       << "MaxAllocSize:   " << this->max_alloc_size << "\n";
-    return ss.str();
-  }
+enum class ArenaExtendStrategy : int32_t {
+  kNextPowerOfTwo = 0,
+  kSameAsRequested,
 };
 
 // A memory allocator that implements a 'best-fit with coalescing'
@@ -83,7 +54,16 @@ struct AllocatorStats {
 // all requests to allocate memory go through this interface.
 class BFCArena : public IArenaAllocator {
  public:
-  BFCArena(std::unique_ptr<IDeviceAllocator> resource_allocator, size_t total_memory);
+  static const ArenaExtendStrategy DEFAULT_ARENA_EXTEND_STRATEGY = ArenaExtendStrategy::kNextPowerOfTwo;
+  static const int DEFAULT_INITIAL_CHUNK_SIZE_BYTES = 1048576;
+  static const int DEFAULT_MAX_DEAD_BYTES_PER_CHUNK = 128 * 1024 * 1024;
+  static const size_t DEFAULT_MAX_MEM = std::numeric_limits<size_t>::max();
+
+  BFCArena(std::unique_ptr<IAllocator> resource_allocator,
+           size_t total_memory,
+           ArenaExtendStrategy arena_extend_strategy = DEFAULT_ARENA_EXTEND_STRATEGY,
+           int initial_chunk_size_bytes = DEFAULT_INITIAL_CHUNK_SIZE_BYTES,
+           int max_dead_bytes_per_chunk = DEFAULT_MAX_DEAD_BYTES_PER_CHUNK);
 
   ~BFCArena() override;
 
@@ -98,15 +78,11 @@ class BFCArena : public IArenaAllocator {
   void* Reserve(size_t size) override;
 
   size_t Used() const override {
-    return stats_.bytes_in_use;
+    return static_cast<size_t>(stats_.bytes_in_use);
   }
 
   size_t Max() const override {
     return memory_limit_;
-  }
-
-  const OrtMemoryInfo& Info() const override {
-    return info_;
   }
 
   FencePtr CreateFence(const SessionState* session_state) override {
@@ -348,9 +324,8 @@ class BFCArena : public IArenaAllocator {
   size_t RoundedBytes(size_t bytes);
 
   // Try to add a new memory region that can satisfy an allocation of
-  // 'rounded_bytes' bytes.  Returns true on success and false on
-  // failure.
-  bool Extend(size_t rounded_bytes);
+  // 'rounded_bytes' bytes.
+  Status Extend(size_t rounded_bytes);
 
   // Returns a pointer to an underlying allocated chunk of size
   // 'rounded_bytes'.
@@ -402,6 +377,7 @@ class BFCArena : public IArenaAllocator {
 
   // Structures immutable after construction
   size_t memory_limit_ = 0;
+  ArenaExtendStrategy arena_extend_strategy_ = ArenaExtendStrategy::kNextPowerOfTwo;
 
   int Log2FloorNonZeroSlow(uint64_t n) {
     int r = 0;
@@ -455,13 +431,9 @@ class BFCArena : public IArenaAllocator {
   char bins_space_[sizeof(Bin) * kNumBins];
 
   // The size of the current region allocation.
-  size_t curr_region_allocation_bytes_;
+  SafeInt<size_t> curr_region_allocation_bytes_;
 
-  // An indicator that expansion of a region has hit the limits
-  // of the available memory.
-  bool started_backpedal_ = false;
-
-  std::unique_ptr<IDeviceAllocator> device_allocator_;
+  std::unique_ptr<IAllocator> device_allocator_;
 
   mutable OrtMutex lock_;
 
@@ -476,9 +448,10 @@ class BFCArena : public IArenaAllocator {
 
   AllocatorStats stats_;
 
-  OrtMemoryInfo info_;
-
   std::unordered_map<void*, size_t> reserved_chunks_;
+
+  const int initial_chunk_size_bytes_;
+  const int max_dead_bytes_per_chunk_;
 
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(BFCArena);
 };

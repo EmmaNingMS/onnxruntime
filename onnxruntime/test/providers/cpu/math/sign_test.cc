@@ -50,19 +50,25 @@ GenerateSequence(OutputIter out) {
 }
 
 template <class T>
-inline auto to_testable_type(T v) {
-  return v;
-}
+struct ToTestableType {
+  static T to_type(T v) {
+    return v;
+  }
+};
 
 template <>
-inline auto to_testable_type(MLFloat16 v) {
-  return math::halfToFloat(v.val);
-}
+struct ToTestableType<MLFloat16> {
+  static float to_type(MLFloat16 v) {
+    return math::halfToFloat(v.val);
+  }
+};
 
 template <>
-inline auto to_testable_type(BFloat16 v) {
-  return v.ToFloat();
-}
+struct ToTestableType<BFloat16> {
+  static float to_type(BFloat16 v) {
+    return v.ToFloat();
+  }
+};
 
 template <class T, class ForwardIter, class OutputIter>
 typename std::enable_if<!std::numeric_limits<T>::is_signed &&
@@ -70,7 +76,7 @@ typename std::enable_if<!std::numeric_limits<T>::is_signed &&
                         !std::is_same<T, BFloat16>::value>::type
 TestImpl(ForwardIter first, ForwardIter last, OutputIter out) {
   std::transform(first, last, out, [](T v) {
-    auto t = to_testable_type<T>(v);
+    auto t = ToTestableType<T>::to_type(v);
     if (t == 0) {
       t = 0;
     } else {
@@ -86,7 +92,7 @@ typename std::enable_if<std::numeric_limits<T>::is_signed ||
                         std::is_same<T, BFloat16>::value>::type
 TestImpl(ForwardIter first, ForwardIter last, OutputIter out) {
   std::transform(first, last, out, [](T v) {
-    auto t = to_testable_type<T>(v);
+    auto t = ToTestableType<T>::to_type(v);
     if (t == 0) {
       t = 0;
     } else if (t > 0) {
@@ -114,7 +120,7 @@ TEST(MathOpTest, Sign_uint64) {
   test.AddOutput<uint64_t>("output", input_dims, output);
   test.Run(OpTester::ExpectResult::kExpectSuccess);
 }
-
+//we disable this test for openvino as openvino ep supports only FP32 Precision
 TEST(MathOpTest, Sign_int64) {
   using namespace test_sign_internal;
   OpTester test("Sign", 9);
@@ -128,7 +134,7 @@ TEST(MathOpTest, Sign_int64) {
   std::vector<int64_t> output;
   TestImpl<int64_t>(input.cbegin(), input.cend(), std::back_inserter(output));
   test.AddOutput<int64_t>("output", input_dims, output);
-  test.Run(OpTester::ExpectResult::kExpectSuccess);
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider});
 }
 
 TEST(MathOpTest, Sign_float) {
@@ -175,6 +181,22 @@ TEST(MathOpTest, Sign_MLFloat16) {
   std::vector<MLFloat16> output;
   TestImpl<MLFloat16>(input.cbegin(), input.cend(), std::back_inserter(output));
   test.AddOutput<MLFloat16>("output", input_dims, output);
+  test.Run(OpTester::ExpectResult::kExpectSuccess);
+}
+
+TEST(MathOpTest, Sign_BFloat16) {
+  using namespace test_sign_internal;
+  OpTester test("Sign", 13);
+
+  std::vector<int64_t> input_dims{7};
+  std::vector<BFloat16> input;
+  GenerateSequence<BFloat16>(std::back_inserter(input));
+  ASSERT_EQ(input.size(), 7U);
+  test.AddInput<BFloat16>("input", input_dims, input);
+
+  std::vector<BFloat16> output;
+  TestImpl<BFloat16>(input.cbegin(), input.cend(), std::back_inserter(output));
+  test.AddOutput<BFloat16>("output", input_dims, output);
   test.Run(OpTester::ExpectResult::kExpectSuccess);
 }
 

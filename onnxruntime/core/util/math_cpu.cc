@@ -19,7 +19,22 @@
 #include "core/util/math.h"
 #include "core/util/math_cpuonly.h"
 #include "core/mlas/inc/mlas.h"
-#include "Eigen/src/Core/arch/GPU/Half.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#else
+#pragma warning(push)
+#pragma warning(disable : 4267)
+#pragma warning(disable : 4127)
+#pragma warning(disable : 4805)
+#pragma warning(disable : 6255)
+#endif
+#include "Eigen/src/Core/arch/Default/Half.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#else
+#pragma warning(pop)
+#endif
 using onnxruntime::concurrency::ThreadPool;
 
 namespace onnxruntime {
@@ -68,50 +83,123 @@ void Gemm<float, ThreadPool>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE
                              float* C, ThreadPool* threadpool) {
   int lda = static_cast<int>((TransA == CblasNoTrans) ? K : M);
   int ldb = static_cast<int>((TransB == CblasNoTrans) ? N : K);
-  MlasSgemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, N, threadpool);
+  MlasGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, N, threadpool);
 }
+
+#if defined(_M_AMD64) || defined(__x86_64__)
+template <>
+void Gemm<double, ThreadPool>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
+                              const int64_t N, const int64_t K, double alpha, const double* A, const double* B, double beta,
+                              double* C, ThreadPool* threadpool) {
+  int lda = static_cast<int>((TransA == CblasNoTrans) ? K : M);
+  int ldb = static_cast<int>((TransB == CblasNoTrans) ? N : K);
+  MlasGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, N, threadpool);
+}
+#else
+template <>
+void Gemm<double, ThreadPool>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
+                              const int64_t N, const int64_t K, double alpha, const double* A, const double* B, double beta,
+                              double* C, ThreadPool*) {
+  auto C_mat = EigenMatrixMap<double>(C, N, M);
+  if (beta == 0) {
+    C_mat.setZero();
+  } else {
+    C_mat *= beta;
+  }
+  switch (TransA) {
+    case CblasNoTrans: {
+      switch (TransB) {
+        case CblasNoTrans:
+          C_mat.noalias() += alpha * (ConstEigenMatrixMap<double>(B, N, K) *
+                                      ConstEigenMatrixMap<double>(A, K, M));
+          return;
+        case CblasTrans:
+          C_mat.noalias() += alpha * (ConstEigenMatrixMap<double>(B, K, N).transpose() *
+                                      ConstEigenMatrixMap<double>(A, K, M));
+          return;
+        default:
+          ORT_THROW("CblasNoTrans Unexpected CBLAS_TRANSPOSE for TransB of ", TransB);
+      }
+    }
+    case CblasTrans: {
+      switch (TransB) {
+        case CblasNoTrans:
+          C_mat.noalias() += alpha * (ConstEigenMatrixMap<double>(B, N, K) *
+                                      ConstEigenMatrixMap<double>(A, M, K).transpose());
+          return;
+        case CblasTrans:
+          C_mat.noalias() += alpha * (ConstEigenMatrixMap<double>(B, K, N).transpose() *
+                                      ConstEigenMatrixMap<double>(A, M, K).transpose());
+          return;
+        default:
+          ORT_THROW("CblasTrans Unexpected CBLAS_TRANSPOSE for TransB of ", TransB);
+      }
+    }
+    default:
+      ORT_THROW("Unexpected CBLAS_TRANSPOSE for TransA of ", TransA);
+  }
+}
+#endif
 
 template <>
 void MatMul<float>(int M, int N, int K, const float* A, const float* B, float* C, ThreadPool* threadpool) {
-  MlasSgemm(CblasNoTrans, CblasNoTrans, M, N, K, 1.f, A, K, B, N, 0.f, C, N, threadpool);
+  MlasGemm(CblasNoTrans, CblasNoTrans, M, N, K, 1.f, A, K, B, N, 0.f, C, N, threadpool);
 }
 
+#if defined(_M_AMD64) || defined(__x86_64__)
+template <>
+void MatMul<double>(int M, int N, int K, const double* A, const double* B, double* C, ThreadPool* threadpool) {
+  MlasGemm(CblasNoTrans, CblasNoTrans, M, N, K, 1.f, A, K, B, N, 0.f, C, N, threadpool);
+}
+#else
 EIGEN_MATMUL_FUNCTION(double)
+#endif
 
 template <>
 void GemmEx<float, ThreadPool>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, int M, int N, int K,
                                float alpha, const float* A, int lda, const float* B, int ldb, float beta, float* C,
                                int ldc, ThreadPool* threadpool) {
-  MlasSgemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, threadpool);
+  MlasGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, threadpool);
 }
 
-template <>
-void Gemv<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, int M, int N, float alpha, const float* A, const float* x,
-                              float beta, float* y, CPUMathUtil* /*provider*/) {
-  EigenVectorMap<float> y_vec(y, TransA == CblasNoTrans ? M : N);
+template <typename T, class Provider>
+void Gemv(CBLAS_TRANSPOSE TransA,
+          int M,
+          int N,
+          float alpha,
+          const T* A,
+          const T* x,
+          float beta,
+          T* y,
+          Provider* /*provider*/) {
+  EigenVectorMap<T> y_vec(y, TransA == CblasNoTrans ? M : N);
   if (beta == 0) {
     // In Caffe2 we often do a lazy initialization, which may contain NaNs in
-    // the float values. As a result, if beta is 0, we explicitly do a setzero.
+    // the float-pointing values. As a result, if beta is 0, we explicitly do a setzero.
     y_vec.setZero();
   } else {
     y_vec *= beta;
   }
   switch (TransA) {
     case CblasNoTrans: {
-      y_vec.noalias() += alpha * (ConstEigenMatrixMap<float>(A, N, M).transpose() *
-                                  ConstEigenVectorMap<float>(x, N));
+      y_vec.noalias() += alpha * (ConstEigenMatrixMap<T>(A, N, M).transpose() *
+                                  ConstEigenVectorMap<T>(x, N));
       return;
     }
     case CblasTrans: {
-      y_vec.noalias() += alpha * (ConstEigenMatrixMap<float>(A, N, M) *
-                                  ConstEigenVectorMap<float>(x, M));
+      y_vec.noalias() += alpha * (ConstEigenMatrixMap<T>(A, N, M) *
+                                  ConstEigenVectorMap<T>(x, M));
       return;
     }
     default:
-      ORT_THROW("Gemv float found an unexpected CBLAS_TRANSPOSE input of", TransA);
+      ORT_THROW("Gemv found an unexpected CBLAS_TRANSPOSE input of", TransA);
   }
 }
 
+template void Gemv<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, int M, int N, float alpha, const float* A, const float* x,
+                                       float beta, float* y, CPUMathUtil*);
+template void Gemv<double, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, int M, int N, float alpha, const double* A, const double* x,
+                                        float beta, double* y, CPUMathUtil*);
 #define SPECIALIZED_AXPY(T)                                                                       \
   template <>                                                                                     \
   void Axpy<T, CPUMathUtil>(int N, const T alpha, const T* x, T* Y, CPUMathUtil* /*provider*/) {  \
@@ -133,6 +221,20 @@ void Gemm<float, ThreadPool>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE
   int lda = gsl::narrow_cast<int>((TransA == CblasNoTrans) ? K : M);
   int ldb = gsl::narrow_cast<int>((TransB == CblasNoTrans) ? N : K);
   cblas_sgemm(CblasRowMajor, TransA, TransB,
+              gsl::narrow_cast<int>(M),
+              gsl::narrow_cast<int>(N),
+              gsl::narrow_cast<int>(K),
+              alpha, A, lda, B, ldb,
+              beta, C, gsl::narrow_cast<int>(N));
+}
+
+template <>
+void Gemm<double, ThreadPool>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
+                              const int64_t N, const int64_t K, double alpha, const double* A, const double* B, double beta,
+                              double* C, ThreadPool* /*context*/) {
+  int lda = gsl::narrow_cast<int>((TransA == CblasNoTrans) ? K : M);
+  int ldb = gsl::narrow_cast<int>((TransB == CblasNoTrans) ? N : K);
+  cblas_dgemm(CblasRowMajor, TransA, TransB,
               gsl::narrow_cast<int>(M),
               gsl::narrow_cast<int>(N),
               gsl::narrow_cast<int>(K),
@@ -164,6 +266,12 @@ void Gemv<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, int M, int N, float 
   cblas_sgemv(CblasRowMajor, TransA, M, N, alpha, A, N, x, 1, beta, y, 1);
 }
 
+template <>
+void Gemv<double, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, int M, int N, float alpha, const double* A, const double* x,
+                               float beta, double* y, CPUMathUtil* /*context*/) {
+  cblas_dgemv(CblasRowMajor, TransA, M, N, alpha, A, N, x, 1, beta, y, 1);
+}
+
 #define CAFFE2_SPECIALIZED_AXPY(T, prefix)                                           \
   template <>                                                                        \
   void Axpy<T, CPUMathUtil>(int N, const T alpha, const T* x, T* y, CPUMathUtil*) {  \
@@ -184,16 +292,11 @@ CAFFE2_SPECIALIZED_AXPY(float, s)
     EigenVectorMap<T>(y, N) = ConstEigenVectorMap<T>(x, N).array().expr(); \
   }
 DELEGATE_SIMPLE_UNARY_FUNCTION(float, Exp, exp)
+DELEGATE_SIMPLE_UNARY_FUNCTION(double, Exp, exp)
+DELEGATE_SIMPLE_UNARY_FUNCTION(float, Log, log)
 DELEGATE_SIMPLE_UNARY_FUNCTION(float, Sqr, square)
 #undef DELEGATE_SIMPLE_UNARY_FUNCTION
 
-#define DELEGATE_POWX_FUNCTION(T)                                          \
-  template <>                                                              \
-  void Powx<T, CPUMathUtil>(int N, const T* a, T b, T* y, CPUMathUtil*) {  \
-    EigenVectorMap<T>(y, N) = ConstEigenVectorMap<T>(a, N).array().pow(b); \
-  }
-DELEGATE_POWX_FUNCTION(float)
-#undef DELEGATE_POWX_FUNCTION
 
 #define EIGEN_SIMPLE_BINARY_FUNCTION(T, Funcname, expr)                                                       \
   template <>                                                                                                 \
@@ -207,7 +310,9 @@ DELEGATE_POWX_FUNCTION(float)
   EIGEN_SIMPLE_BINARY_FUNCTION(int64_t, Funcname, expr)
 
 DEFINE_SIMPLE_BINARY_FUNCTION(Add, +)
+DEFINE_SIMPLE_BINARY_FUNCTION(Sub, -)
 DEFINE_SIMPLE_BINARY_FUNCTION(Mul, *)
+DEFINE_SIMPLE_BINARY_FUNCTION(Div, /)
 
 #undef EIGEN_SIMPLE_BINARY_FUNCTION
 #undef DEFINE_FLOAT_BINARY_FUNCTION
@@ -224,6 +329,7 @@ DEFINE_SIMPLE_BINARY_FUNCTION(Mul, *)
     EigenVectorMap<T>(y, N) = ConstEigenMatrixMap<T>(x, D, N).colwise().maxCoeff(); \
   }
 SPECIALIZED_ROWWISEMAX(float)
+SPECIALIZED_ROWWISEMAX(double)
 #undef SPECIALIZED_ROWWISEMAX
 
 #define SPECIALIZED_SET(T)                                                       \
@@ -248,55 +354,52 @@ SPECIALIZED_SET(uint8_t);
 SPECIALIZED_SET(uint16_t);
 #undef SPECIALIZED_SET
 
-template <>
-void Col2imNd<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, const int64_t* img_shape,
-                                                      const int64_t* col_shape, int64_t img_size, int64_t col_size,
-                                                      const int64_t* kernel_shape, const int64_t* stride,
-                                                      const int64_t* dilation, const int64_t* pad, int64_t N,
-                                                      float* data_img, CPUMathUtil* context) {
-  Set<float, CPUMathUtil>(img_size, 0, data_img, context);
-  Im2colNd<float, CPUMathUtil, StorageOrder::NCHW>()(
-      data_col,
-      img_shape,
-      col_shape,
-      img_size,
-      col_size,
-      kernel_shape,
-      stride,
-      dilation,
-      pad,
-      N,
-      data_img,
-      context,
-      true);
-}
+template <typename T>
+void Im2col<T, StorageOrder::NCHW>::operator()(const T* data_im, int64_t channels, int64_t height,
+                                               int64_t width, int64_t kernel_h, int64_t kernel_w,
+                                               int64_t dilation_h, int64_t dilation_w, int64_t pad_t,
+                                               int64_t pad_l, int64_t pad_b, int64_t pad_r, int64_t stride_h,
+                                               int64_t stride_w, T* data_col, T padding_value) {
+  const int64_t output_h = (height + pad_b + pad_t - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
+  const int64_t output_w = (width + pad_l + pad_r - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
 
-static void Im2colWithEqualPadding(int64_t output_h, int64_t output_w, const float* data_im, int64_t channels,
-                                   int64_t height, int64_t width, int64_t kernel_h, int64_t kernel_w,
-                                   int64_t dilation_h, int64_t dilation_w, int64_t pad_t, int64_t pad_l,
-                                   int64_t stride_h, int64_t stride_w, float* data_col) {
   // From Intel, https://github.com/BVLC/caffe/pull/3536
-  int64_t pad_h = pad_t;
-  int64_t pad_w = pad_l;
   int64_t channel_size = height * width;
   for (int64_t channel = channels; channel--; data_im += channel_size) {
     for (int64_t kernel_row = 0; kernel_row < kernel_h; kernel_row++) {
       for (int64_t kernel_col = 0; kernel_col < kernel_w; kernel_col++) {
-        int64_t input_row = -pad_h + kernel_row * dilation_h;
+        int64_t input_row = -pad_t + kernel_row * dilation_h;
         for (int64_t output_rows = output_h; output_rows; output_rows--) {
           if (!is_a_ge_zero_and_a_lt_b(input_row, height)) {
-            memset(data_col, 0, output_w * sizeof(float));
+            std::fill_n(data_col, output_w, padding_value);
             data_col += output_w;
           } else {
-            int64_t input_col = -pad_w + kernel_col * dilation_w;
-            const float* rdptr = data_im + input_row * width + input_col;
-            for (int64_t i = 0; i != output_w; ++i) {
+            int64_t input_col = -pad_l + kernel_col * dilation_w;
+            const T* rdptr = data_im + input_row * width + input_col;
+            for (int64_t i = 0; i < output_w;) {
+              int64_t output_handled = 1;
               if (is_a_ge_zero_and_a_lt_b(input_col, width)) {
-                *(data_col++) = rdptr[i * stride_w];
+                if (stride_w == 1) {
+                  // Compute the minimum of the number of input elements remaining
+                  // and the number of output elements to produce.
+                  output_handled = std::min(width - input_col, output_w - i);
+                  data_col = std::copy_n(&rdptr[i], static_cast<size_t>(output_handled), data_col);
+                } else if (stride_w == 2) {
+                  // Same as above except using the number of strided input elements.
+                  output_handled = std::min((width - input_col + 1) / 2, output_w - i);
+                  const T* local_rdptr = &rdptr[i * 2];
+                  for (int64_t x = output_handled; x > 0; x--) {
+                    *(data_col++) = *local_rdptr;
+                    local_rdptr += 2;
+                  }
+                } else {
+                  *(data_col++) = rdptr[i * stride_w];
+                }
               } else {
-                *(data_col++) = 0;
+                *(data_col++) = padding_value;
               }
-              input_col += stride_w;
+              input_col += output_handled * stride_w;
+              i += output_handled;
             }
           }
           input_row += stride_h;
@@ -305,90 +408,16 @@ static void Im2colWithEqualPadding(int64_t output_h, int64_t output_w, const flo
     }
   }
 }
-template <>
-void Im2col<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_im, int64_t channels, int64_t height,
-                                                    int64_t width, int64_t kernel_h, int64_t kernel_w,
-                                                    int64_t dilation_h, int64_t dilation_w, int64_t pad_t,
-                                                    int64_t pad_l, int64_t pad_b, int64_t pad_r, int64_t stride_h,
-                                                    int64_t stride_w, float* data_col, CPUMathUtil* /*context*/) {
-  const int64_t output_h =
-      (height + pad_b + pad_t - (dilation_h * (kernel_h - 1) + 1)) / stride_h +
-      1;
-  const int64_t output_w =
-      (width + pad_l + pad_r - (dilation_w * (kernel_w - 1) + 1)) / stride_w +
-      1;
 
-  // Fast path for zero padding and no dilation
-  // From Torch, THNN_(unfolded_copy)
-  if (dilation_h == 1 && dilation_w == 1 && pad_l == 0 && pad_r == 0 &&
-      pad_t == 0 && pad_b == 0) {
-    for (auto k = 0; k < channels * kernel_h * kernel_w; k++) {
-      const auto nip = k / (kernel_h * kernel_w);
-      const auto rest = k % (kernel_h * kernel_w);
-      const auto kh = rest / kernel_w;
-      const auto kw = rest % kernel_w;
-      auto* dst = data_col + nip * (kernel_h * kernel_w * output_h * output_w) +
-                  kh * (kernel_w * output_h * output_w) + kw * (output_h * output_w);
-      const auto* src = data_im + nip * (height * width);
-      for (auto y = 0; y < output_h; y++) {
-        const auto iy = y * stride_h + kh;
-        const auto ix = kw;
-        if (stride_w == 1) {
-          memcpy(
-              dst + (y * output_w),
-              src + (iy * width + ix),
-              sizeof(float) * output_w);
-        } else {
-          for (auto x = 0; x < output_w; x++) {
-            memcpy(
-                dst + (y * output_w + x),
-                src + (iy * width + ix + x * stride_w),
-                sizeof(float));
-          }
-        }
-      }
-    }
-    return;
-  }
-
-  // Fast path for equal padding
-  if (pad_l == pad_r && pad_t == pad_b) {
-    Im2colWithEqualPadding(output_h, output_w, data_im, channels, height, width, kernel_h, kernel_w, dilation_h, dilation_w, pad_t, pad_l, stride_h, stride_w, data_col);
-    return;
-  }
-
-  // Baseline
-  const int64_t dkernel_h = dilation_h * (kernel_h - 1) + 1;
-  const int64_t dkernel_w = dilation_w * (kernel_w - 1) + 1;
-
-  int64_t height_col = (height + pad_t + pad_b - dkernel_h) / stride_h + 1;
-  int64_t width_col = (width + pad_l + pad_r - dkernel_w) / stride_w + 1;
-
-  int64_t channels_col = channels * kernel_h * kernel_w;
-  for (int64_t c = 0; c < channels_col; ++c) {
-    int64_t w_offset = c % kernel_w;
-    int64_t h_offset = (c / kernel_w) % kernel_h;
-    int64_t c_im = c / kernel_h / kernel_w;
-    for (int64_t h = 0; h < height_col; ++h) {
-      for (int64_t w = 0; w < width_col; ++w) {
-        int64_t h_pad = h * stride_h - pad_t + h_offset * dilation_h;
-        int64_t w_pad = w * stride_w - pad_l + w_offset * dilation_w;
-        if (h_pad >= 0 && h_pad < height && w_pad >= 0 && w_pad < width)
-          data_col[(c * height_col + h) * width_col + w] =
-              data_im[(c_im * height + h_pad) * width + w_pad];
-        else
-          data_col[(c * height_col + h) * width_col + w] = 0;
-      }
-    }
-  }
-}
+template struct Im2col<float, StorageOrder::NCHW>;
+template struct Im2col<uint8_t, StorageOrder::NCHW>;
 
 template <>
-void Im2col<float, CPUMathUtil, StorageOrder::NHWC>(const float* data_im, int64_t channels, int64_t height,
-                                                    int64_t width, int64_t kernel_h, int64_t kernel_w,
-                                                    int64_t dilation_h, int64_t dilation_w, int64_t pad_t,
-                                                    int64_t pad_l, int64_t pad_b, int64_t pad_r, int64_t stride_h,
-                                                    int64_t stride_w, float* data_col, CPUMathUtil* /*context*/) {
+void Im2col<float, StorageOrder::NHWC>::operator()(const float* data_im, int64_t channels, int64_t height,
+                                                   int64_t width, int64_t kernel_h, int64_t kernel_w,
+                                                   int64_t dilation_h, int64_t dilation_w, int64_t pad_t,
+                                                   int64_t pad_l, int64_t pad_b, int64_t pad_r, int64_t stride_h,
+                                                   int64_t stride_w, float* data_col, float padding_value) {
   const int64_t dkernel_h = dilation_h * (kernel_h - 1) + 1;
   const int64_t dkernel_w = dilation_w * (kernel_w - 1) + 1;
 
@@ -405,8 +434,7 @@ void Im2col<float, CPUMathUtil, StorageOrder::NHWC>(const float* data_im, int64_
             memcpy(data_col, data_im + (ih * width + iw) * channels,
                    sizeof(float) * channels);
           } else {
-            // This should be simply padded with zero.
-            memset(data_col, 0, sizeof(float) * channels);
+            std::fill_n(data_col, channels, padding_value);
           }
           data_col += channels;
         }
@@ -553,6 +581,28 @@ void Col2im<float, CPUMathUtil, StorageOrder::NHWC>(const float* data_col, int64
   }
 }
 
+template <>
+void Col2imNd<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, const int64_t* img_shape,
+                                                      const int64_t* col_shape, int64_t img_size, int64_t col_size,
+                                                      const int64_t* kernel_shape, const int64_t* stride,
+                                                      const int64_t* dilation, const int64_t* pad, int64_t N,
+                                                      float* data_img, CPUMathUtil* context) {
+  Set<float, CPUMathUtil>(img_size, 0, data_img, context);
+  Im2colNd<float, StorageOrder::NCHW>()(
+      data_col,
+      img_shape,
+      col_shape,
+      img_size,
+      col_size,
+      kernel_shape,
+      stride,
+      dilation,
+      pad,
+      N,
+      data_img,
+      true);
+}
+
 #define SPECIALIZED_COPYVECTOR(T)                                                          \
   template <>                                                                              \
   void CopyVector<T, CPUMathUtil>(int N, const T* src, T* dst, CPUMathUtil* /*context*/) { \
@@ -567,9 +617,81 @@ uint16_t floatToHalf(float f) {
   return Eigen::half_impl::float_to_half_rtne(f).x;
 }
 
+uint16_t doubleToHalf(double f) {
+  return Eigen::half_impl::float_to_half_rtne(static_cast<float>(f)).x;
+}
+
 float halfToFloat(uint16_t h) {
   return Eigen::half_impl::half_to_float(Eigen::half_impl::raw_uint16_to_half(h));
 }
+
+// AddToRow and AddToCol adds the corresponding row/col vector b to the matrix a
+// of shape M x N. The actual implementation uses eigen which is column major,
+// so notice the row/column swap in the actual implementation.
+#define DELEGATE_BROADCAST_BINARY_FUNCTION(T, Funcname, expr)                                                    \
+  template <>                                                                                                    \
+  void Funcname##ToRow<T, CPUMathUtil>(int M, int N, const T* a, const T* b, T* y, CPUMathUtil*) {               \
+    EigenArrayMap<T>(y, N, M) = ConstEigenArrayMap<T>(a, N, M).colwise() expr ConstEigenVectorArrayMap<T>(b, N); \
+  }                                                                                                              \
+  /* inplace versions */                                                                                         \
+  template <>                                                                                                    \
+  void Funcname##ToRow<T, CPUMathUtil>(int M, int N, const T* x, T* y, CPUMathUtil*) {                           \
+    EigenArrayMap<T>(y, N, M).colwise() expr## = ConstEigenVectorArrayMap<T>(x, N);                              \
+  }                                                                                                              \
+  template <>                                                                                                    \
+  void Funcname##ToCol<T, CPUMathUtil>(int M, int N, const T* x, T* y, CPUMathUtil*) {                           \
+    EigenArrayMap<T>(y, N, M).rowwise() expr## = ConstEigenVectorArrayMap<T>(x, M).transpose();                  \
+  }
+
+#define DEFINE_BROADCAST_BINARY_FUNCTION(name, op)      \
+  DELEGATE_BROADCAST_BINARY_FUNCTION(int32_t, name, op) \
+  DELEGATE_BROADCAST_BINARY_FUNCTION(int64_t, name, op) \
+  DELEGATE_BROADCAST_BINARY_FUNCTION(float, name, op)
+
+DEFINE_BROADCAST_BINARY_FUNCTION(Add, +)
+DEFINE_BROADCAST_BINARY_FUNCTION(Sub, -)
+DEFINE_BROADCAST_BINARY_FUNCTION(Mul, *)
+DEFINE_BROADCAST_BINARY_FUNCTION(Div, /)
+
+#define SPECIALIZED_ROWWISESUM(T)                                                 \
+  template <>                                                                     \
+  void RowwiseSum<T, CPUMathUtil>(int N, int D, const T* x, T* y, CPUMathUtil*) { \
+    EigenVectorMap<T>(y, N) = ConstEigenMatrixMap<T>(x, D, N).colwise().sum();    \
+  }
+SPECIALIZED_ROWWISESUM(float)
+#undef SPECIALIZED_ROWWISESUM
+
+#define SPECIALIZED_SUM(T)                                                                             \
+  template <>                                                                                          \
+  void Sum<T, CPUMathUtil>(int N, const T* x, T* y, CPUMathUtil* /* unused */, Tensor* /* unused */) { \
+    *y = ConstEigenVectorMap<T>(x, N).sum();                                                           \
+  }
+
+SPECIALIZED_SUM(float);
+SPECIALIZED_SUM(int32_t);
+SPECIALIZED_SUM(int64_t);
+
+#undef SPECIALIZED_SUM
+
+#define SPECIALIZED_SCALE(T)                                                                           \
+  template <>                                                                                          \
+  void Scale<T, CPUMathUtil>(int n, float alpha, const T* x, T* y, CPUMathUtil* /*provider*/) {        \
+    EigenVectorMap<T>(y, n) = ConstEigenVectorMap<T>(x, n) * alpha;                                    \
+  }                                                                                                    \
+  template <>                                                                                          \
+  void Scale<T, CPUMathUtil>(int n, const float* alpha, const T* x, T* y, CPUMathUtil* /*provider*/) { \
+    EigenVectorMap<T>(y, n) = ConstEigenVectorMap<T>(x, n) * (*alpha);                                 \
+  }
+SPECIALIZED_SCALE(float)
+#undef SPECIALIZED_SCALE
+
+#define SPECIALIZED_DOT(T)                                                                   \
+  template <>                                                                                \
+  void Dot<T, CPUMathUtil>(int N, const T* a, const T* b, T* y, CPUMathUtil* /*provider*/) { \
+    *y = ConstEigenVectorMap<T>(a, N).dot(ConstEigenVectorMap<T>(b, N));                     \
+  }
+SPECIALIZED_DOT(float)
+#undef SPECIALIZED_DOT
 
 }  // namespace math
 }  // namespace onnxruntime

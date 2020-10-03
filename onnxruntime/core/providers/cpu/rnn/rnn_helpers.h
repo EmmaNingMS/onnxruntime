@@ -7,22 +7,16 @@
 #pragma warning(disable : 4267)
 #endif
 
-#include <algorithm>
-#include <functional>
-#include <future>
-#include <string>
-#include <vector>
-
-#include "gsl/span"
-#include "gsl/gsl_algorithm"
-
 #include "core/common/common.h"
 #include "core/common/logging/logging.h"
 #include "core/framework/allocator.h"
 #include "core/util/math.h"
 #include "core/util/math_cpuonly.h"
-
+#include "core/mlas/inc/mlas.h"
+#include "core/common/safeint.h"
 #include "core/platform/threadpool.h"
+
+#include "gsl/gsl"
 
 namespace onnxruntime {
 class Tensor;
@@ -47,8 +41,8 @@ inline Direction MakeDirection(const std::string& direction) {
   if (direction == "bidirectional") {
     return kBidirectional;
   }
-    ORT_THROW("Invalid 'direction' argument of '", direction,
-              "'. Must be one of 'forward', 'reverse', or 'bidirectional'.");
+  ORT_THROW("Invalid 'direction' argument of '", direction,
+            "'. Must be one of 'forward', 'reverse', or 'bidirectional'.");
 }
 
 /** Allocate a unique_ptr using allocator_, and return a span to the allocated memory so usage is safe
@@ -77,8 +71,8 @@ gsl::span<TAlloc> Allocate(std::shared_ptr<IAllocator> allocator,
 
 // validate the common inputs to RNN, LSTM and GRU operators
 Status ValidateCommonRnnInputs(const Tensor& X,
-                               const Tensor& W,
-                               const Tensor& R,
+                               const TensorShape& W_shape,
+                               const TensorShape& R_shape,
                                const Tensor* B,
                                int WRB_dim_1_multipler,  // multiplier used with hidden_size for W, R and B inputs
                                const Tensor* sequence_lens,
@@ -113,14 +107,11 @@ void ReverseSequence(gsl::span<const T> inputs,
                      const int max_sequence_length,
                      const int batch_size,
                      const int input_size,
-                     const int num_directions) {
+                     const int num_directions,
+                     concurrency::ThreadPool*) {
   for (int i = 0; i < batch_size; i++) {
     int seq_len = sequence_lengths[i];
 
-#ifdef USE_OPENMP
-// Parallel execute the loop.
-#pragma omp parallel for
-#endif
     for (int j = 0; j < seq_len; j++) {
       gsl::span<const T> src = inputs.subspan(j * batch_size * input_size + i * input_size, input_size);
       gsl::span<T> dest = inputs_reverse.subspan(num_directions * (seq_len - j - 1) * batch_size * input_size + i * input_size, input_size);
@@ -129,10 +120,6 @@ void ReverseSequence(gsl::span<const T> inputs,
       gsl::copy(src, dest);
     }
 
-#ifdef USE_OPENMP
-// Parallel execute the loop.
-#pragma omp parallel for
-#endif
     for (int j = seq_len; j < max_sequence_length; j++) {
       gsl::span<const T> src = inputs.subspan(j * batch_size * input_size + i * input_size, input_size);
       gsl::span<T> dest = inputs_reverse.subspan(num_directions * j * batch_size * input_size + i * input_size, input_size);
@@ -159,7 +146,8 @@ void ComputeGemm(const int M,
                  const float beta,
                  TSpanCIter C,
                  TSpanCIter C_end,
-                 const int ldc, concurrency::ThreadPool* tp) {
+                 const int ldc,
+                 concurrency::ThreadPool* thread_pool) {
   // validate all the inputs
   // need to use the lda/ldb/ldc strides which should be >= the columns for the span
   ORT_ENFORCE(lda >= K && ldb >= K && ldc >= N);
@@ -172,7 +160,64 @@ void ComputeGemm(const int M,
       M, N, K, alpha,
       &*A, lda,
       &*B, ldb, beta,
-      &*C, ldc, tp);
+      &*C, ldc, thread_pool);
+}
+
+struct PackedWeights {
+  BufferUniquePtr buffer_;
+  size_t weights_size_;
+  TensorShape shape_;
+};
+
+template <typename T>
+struct GemmWeights {
+  GemmWeights(int idx, const T* weights_data, size_t weights_size, const PackedWeights& packed_weights) {
+    if (packed_weights.buffer_) {
+      is_prepacked_ = true;
+      buffer_ = static_cast<uint8_t*>(packed_weights.buffer_.get()) + packed_weights.weights_size_ * idx;
+    } else {
+      is_prepacked_ = false;
+      buffer_ = weights_data + weights_size * idx;
+    }
+  }
+
+  bool is_prepacked_;
+  const void* buffer_;
+};
+
+template <typename TSpanAIter, typename TSpanCIter>
+void ComputeGemm(const int M,
+                 const int N,
+                 const int K,
+                 const float alpha,
+                 TSpanAIter A,
+                 TSpanAIter A_end,
+                 const GemmWeights<float>& weights,
+                 const float beta,
+                 TSpanCIter C,
+                 TSpanCIter C_end,
+                 const int ldc,
+                 concurrency::ThreadPool* thread_pool) {
+  // validate all the inputs
+  // need to use the lda/ldb/ldc strides which should be >= the columns for the span
+  ORT_ENFORCE(A + (M * K) <= A_end);
+  ORT_ENFORCE(C + (M * ldc - (ldc - N)) <= C_end);
+
+  if (weights.is_prepacked_) {
+    MlasGemm(
+        CblasNoTrans,
+        M, N, K, alpha,
+        &*A, K,
+        weights.buffer_, beta,
+        &*C, ldc, thread_pool);
+  } else {
+    ::onnxruntime::math::GemmEx<float>(
+        CblasNoTrans, CblasTrans,
+        M, N, K, alpha,
+        &*A, K,
+        static_cast<const float *>(weights.buffer_), K, beta,
+        &*C, ldc, thread_pool);
+  }
 }
 
 // helper to convert a span to a raw pointer
@@ -209,39 +254,6 @@ template <typename T>
 T* SafeRawPointer(typename gsl::span<T> span, size_t offset, size_t size) {
   ORT_ENFORCE(offset + size <= size_t(span.size()));
   return span.data() + offset;
-}
-
-template <typename TLambda>
-void ExecuteLambdaInParallel(const std::string& name, TLambda lambda, int max, int step,
-                             onnxruntime::concurrency::ThreadPool& ttp,
-                             const ::onnxruntime::logging::Logger& logger) {
-  // #define NOTHREADS to execute the lambdas directly and in order if you need to do that to debug
-
-#ifdef NOTHREADS
-  ORT_UNUSED_PARAMETER(ttp);
-  ORT_UNUSED_PARAMETER(logger);
-
-  for (int i = 0; i < max; i += step) {
-    (void)name;
-    std::bind(lambda, i)();
-  }
-#else
-
-  ORT_UNUSED_PARAMETER(name);
-  ORT_UNUSED_PARAMETER(logger);
-
-  std::atomic<int> done(0);
-  for (int i = 0; i < max; i += step) {
-    ttp.Schedule([lambda, i, &done]() {
-      lambda(i);
-      ++done;
-    });
-  }
-
-  int totalTasks = max / (step > 0 ? step : 1) + (max % step > 0 ? 1 : 0);
-  while (done != totalTasks)
-    ;
-#endif
 }
 
 void DumpMatrixImpl(const std::string& name, const float* src, int row, int col,

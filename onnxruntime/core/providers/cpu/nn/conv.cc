@@ -14,123 +14,137 @@
 * limitations under the License.
 */
 /* Modifications Copyright (c) Microsoft. */
-#include "core/framework/op_kernel_context_internal.h"
 
 #include "core/providers/cpu/nn/conv.h"
-#include "core/framework/op_kernel_context_internal.h"
+
+#include "core/common/safeint.h"
 #include "core/util/math_cpuonly.h"
 
 namespace onnxruntime {
 
 template <typename T>
 Status Conv<T>::Compute(OpKernelContext* context) const {
-  size_t num_inputs = OpKernel::Node().InputDefs().size();
-  auto ctx_internal = static_cast<OpKernelContextInternal*>(context);
-  concurrency::ThreadPool* tp = ctx_internal->GetOperatorThreadPool();
-
   const auto* X = context->Input<Tensor>(0);
   const auto* W = context->Input<Tensor>(1);
-  const Tensor* B = num_inputs == 3 ? context->Input<Tensor>(2) : nullptr;
+  const Tensor* B = context->Input<Tensor>(2);  // optional. nullptr if not provided
   const int64_t N = X->Shape()[0];
   const int64_t C = X->Shape()[1];
   const int64_t M = W->Shape()[0];
-  ORT_RETURN_IF_ERROR(ValidateInputShape(X, W));
+  ORT_RETURN_IF_ERROR(conv_attrs_.ValidateInputShape(X, W));
 
   std::vector<int64_t> kernel_shape;
-  ORT_RETURN_IF_ERROR(ComputeKernelShape(W->Shape(), kernel_shape));
+  ORT_RETURN_IF_ERROR(conv_attrs_.ComputeKernelShape(W->Shape(), kernel_shape));
 
-  bool Is2DKernel = kernel_shape.size() == 2;
-  std::vector<int64_t> pads(pads_);
+  std::vector<int64_t> pads(conv_attrs_.pads);
   if (pads.empty()) {
     pads.resize(kernel_shape.size() * 2, 0);
   }
-  std::vector<int64_t> dilations(dilations_);
+  std::vector<int64_t> dilations(conv_attrs_.dilations);
   if (dilations.empty()) {
     dilations.resize(kernel_shape.size(), 1);
   }
-  std::vector<int64_t> strides(strides_);
+  std::vector<int64_t> strides(conv_attrs_.strides);
   if (strides.empty()) {
     strides.resize(kernel_shape.size(), 1);
   }
 
-  std::vector<int64_t> Y_dims;
-  Y_dims.insert(Y_dims.begin(), {N, M});
+  std::vector<int64_t> Y_dims({N, M});
   TensorShape input_shape = X->Shape().Slice(2);
-  ORT_RETURN_IF_ERROR(InferOutputShape(input_shape, kernel_shape, strides, dilations, &pads, &Y_dims));
-  Tensor* Y = context->Output(0, TensorShape(Y_dims));
+  ORT_RETURN_IF_ERROR(conv_attrs_.InferOutputShape(input_shape, kernel_shape, strides, dilations, pads, Y_dims));
+  Tensor* Y = context->Output(0, Y_dims);
   TensorShape output_shape = Y->Shape().Slice(2);
+
+  // Bail out early if one of the dimensions is zero.
+  if (Y->Shape().Size() == 0) {
+    return Status::OK();
+  }
 
   const int64_t input_image_size = input_shape.Size();
   const int64_t output_image_size = output_shape.Size();
   const int64_t kernel_size = TensorShape(kernel_shape).Size();
-  const int64_t X_offset = C / group_ * input_image_size;
-  const int64_t Y_offset = Y->Shape().Size() / Y->Shape()[0] / group_;
-  const int64_t W_offset = W->Shape().Size() / group_;
-  const int64_t kernel_dim = C / group_ * kernel_size;
+  const int64_t X_offset = C / conv_attrs_.group * input_image_size;
+  const int64_t Y_offset = Y->Shape().Size() / Y->Shape()[0] / conv_attrs_.group;
+  const int64_t W_offset = W->Shape().Size() / conv_attrs_.group;
+  const int64_t kernel_dim = C / conv_attrs_.group * kernel_size;
   const int64_t col_buffer_size = kernel_dim * output_image_size;
 
-  AllocatorPtr alloc;
-  ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&alloc));
+  const size_t kernel_rank = kernel_shape.size();
 
-  auto col_data = alloc->Alloc(sizeof(T) * col_buffer_size);
-  BufferUniquePtr col_buffer(col_data, BufferDeleter(alloc));
+  BufferUniquePtr col_buffer;
+  std::vector<int64_t> col_buffer_shape;
+
+  // Pointwise convolutions can use the original input tensor in place,
+  // otherwise a temporary buffer is required for the im2col transform.
+  if (kernel_size != 1 || !conv_attrs_.HasStridesOneAndNoPadding()) {
+    AllocatorPtr alloc;
+    ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&alloc));
+
+    auto* col_data = alloc->Alloc(SafeInt<size_t>(sizeof(T)) * col_buffer_size);
+    col_buffer = BufferUniquePtr(col_data, BufferDeleter(alloc));
+
+    if (kernel_rank != 2) {
+      const auto& output_dims = output_shape.GetDims();
+      col_buffer_shape.reserve(1 + output_dims.size());
+      col_buffer_shape.push_back(kernel_dim);
+      col_buffer_shape.insert(col_buffer_shape.end(), output_dims.begin(), output_dims.end());
+    }
+  }
+
   T* col_buffer_data = static_cast<T*>(col_buffer.get());
+
+  concurrency::ThreadPool* thread_pool = context->GetOperatorThreadPool();
 
   const T* Xdata = X->template Data<T>();
   T* Ydata = Y->template MutableData<T>();
 
-  TensorShape image_shape = X->Shape().Slice(1);
-  std::vector<int64_t> col_buffer_shape{kernel_dim};
-  col_buffer_shape.insert(col_buffer_shape.end(), output_shape.GetDims().begin(),
-                          output_shape.GetDims().end());
-
   for (int image_id = 0; image_id < N; ++image_id) {
-    for (int group_id = 0; group_id < group_; ++group_id) {
-      if (Is2DKernel) {
-        math::Im2col<T, CPUMathUtil, StorageOrder::NCHW>(
-            Xdata + group_id * X_offset,
-            C / group_,
-            input_shape[0],
-            input_shape[1],
-            kernel_shape[0],
-            kernel_shape[1],
-            dilations[0],
-            dilations[1],
-            pads[0],
-            pads[1],
-            pads[2],
-            pads[3],
-            strides[0],
-            strides[1],
-            col_buffer_data,
-            &CPUMathUtil::Instance());
-      } else {
-        math::Im2colNd<T, CPUMathUtil, StorageOrder::NCHW>()(
-            Xdata + group_id * X_offset,
-            image_shape.GetDims().data(),
-            col_buffer_shape.data(),
-            C * input_image_size,
-            col_buffer_size,
-            kernel_shape.data(),
-            strides.data(),
-            dilations.data(),
-            pads.data(),
-            static_cast<int>(kernel_shape.size()),
-            col_buffer_data,
-            &CPUMathUtil::Instance());
+    for (int group_id = 0; group_id < conv_attrs_.group; ++group_id) {
+      if (col_buffer_data != nullptr) {
+        if (kernel_rank == 2) {
+          math::Im2col<T, StorageOrder::NCHW>()(
+              Xdata + group_id * X_offset,
+              C / conv_attrs_.group,
+              input_shape[0],
+              input_shape[1],
+              kernel_shape[0],
+              kernel_shape[1],
+              dilations[0],
+              dilations[1],
+              pads[0],
+              pads[1],
+              pads[2],
+              pads[3],
+              strides[0],
+              strides[1],
+              col_buffer_data);
+        } else {
+          math::Im2colNd<T, StorageOrder::NCHW>()(
+              Xdata + group_id * X_offset,
+              X->Shape().GetDims().data() + 1,
+              col_buffer_shape.data(),
+              C * input_image_size,
+              col_buffer_size,
+              kernel_shape.data(),
+              strides.data(),
+              dilations.data(),
+              pads.data(),
+              static_cast<int>(kernel_shape.size()),
+              col_buffer_data);
+        }
       }
+
       math::Gemm<T>(
           CblasNoTrans,
           CblasNoTrans,
-          M / group_,
+          M / conv_attrs_.group,
           output_image_size,
           kernel_dim,
           1,
           W->template Data<T>() + group_id * W_offset,
-          col_buffer_data,
+          col_buffer_data == nullptr ? Xdata + group_id * X_offset : col_buffer_data,
           0,
           Ydata + group_id * Y_offset,
-          tp);
+          thread_pool);
     }
 
     if (B != nullptr) {
@@ -139,17 +153,14 @@ Status Conv<T>::Compute(OpKernelContext* context) const {
       Ymatrix.rowwise() += Bvec.transpose();
     }
 
-    Xdata += X_offset * group_;
-    Ydata += Y_offset * group_;
+    Xdata += X_offset * conv_attrs_.group;
+    Ydata += Y_offset * conv_attrs_.group;
   }
 
   return Status::OK();
 }
 
 Status Conv<float>::Compute(OpKernelContext* context) const {
-  auto ctx_internal = static_cast<OpKernelContextInternal*>(context);
-  concurrency::ThreadPool* tp = ctx_internal->GetOperatorThreadPool();
-
   size_t num_inputs = OpKernel::Node().InputDefs().size();
   const auto* X = context->Input<Tensor>(0);
   const auto* W = context->Input<Tensor>(1);
@@ -157,30 +168,34 @@ Status Conv<float>::Compute(OpKernelContext* context) const {
   const int64_t N = X->Shape()[0];
   const int64_t C = X->Shape()[1];
   const int64_t M = W->Shape()[0];
-  ORT_RETURN_IF_ERROR(ValidateInputShape(X, W));
+  ORT_RETURN_IF_ERROR(conv_attrs_.ValidateInputShape(X, W));
 
   std::vector<int64_t> kernel_shape;
-  ORT_RETURN_IF_ERROR(ComputeKernelShape(W->Shape(), kernel_shape));
+  ORT_RETURN_IF_ERROR(conv_attrs_.ComputeKernelShape(W->Shape(), kernel_shape));
 
-  std::vector<int64_t> pads(pads_);
+  std::vector<int64_t> pads(conv_attrs_.pads);
   if (pads.empty()) {
     pads.resize(kernel_shape.size() * 2, 0);
   }
-  std::vector<int64_t> dilations(dilations_);
+  std::vector<int64_t> dilations(conv_attrs_.dilations);
   if (dilations.empty()) {
     dilations.resize(kernel_shape.size(), 1);
   }
-  std::vector<int64_t> strides(strides_);
+  std::vector<int64_t> strides(conv_attrs_.strides);
   if (strides.empty()) {
     strides.resize(kernel_shape.size(), 1);
   }
 
-  std::vector<int64_t> Y_dims;
-  Y_dims.insert(Y_dims.begin(), {N, M});
+  std::vector<int64_t> Y_dims({N, M});
   TensorShape input_shape = X->Shape().Slice(2);
-  ORT_RETURN_IF_ERROR(InferOutputShape(input_shape, kernel_shape, strides, dilations, &pads, &Y_dims));
+  ORT_RETURN_IF_ERROR(conv_attrs_.InferOutputShape(input_shape, kernel_shape, strides, dilations, pads, Y_dims));
   Tensor* Y = context->Output(0, TensorShape(Y_dims));
   TensorShape output_shape = Y->Shape().Slice(2);
+
+  // Bail out early if one of the dimensions is zero.
+  if (Y->Shape().Size() == 0) {
+    return Status::OK();
+  }
 
   AllocatorPtr alloc;
   ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&alloc));
@@ -190,27 +205,29 @@ Status Conv<float>::Compute(OpKernelContext* context) const {
   auto* Ydata = Y->template MutableData<float>();
 
   const size_t kernel_rank = kernel_shape.size();
+  concurrency::ThreadPool* thread_pool = context->GetOperatorThreadPool();
 
-  if (kernel_rank == 2 || kernel_rank == 3) {
+  if (kernel_rank >= 1 && kernel_rank <= 3) {
     MLAS_CONV_PARAMETERS Parameters;
     size_t WorkingBufferSize;
     MlasConvPrepare(&Parameters,
                     kernel_rank,
                     static_cast<size_t>(N),
-                    static_cast<size_t>(group_),
-                    static_cast<size_t>(C / group_),
+                    static_cast<size_t>(conv_attrs_.group),
+                    static_cast<size_t>(C / conv_attrs_.group),
                     input_shape.GetDims().data(),
                     kernel_shape.data(),
                     dilations.data(),
                     pads.data(),
                     strides.data(),
                     output_shape.GetDims().data(),
-                    static_cast<size_t>(M / group_),
+                    static_cast<size_t>(M / conv_attrs_.group),
                     &activation_,
                     &WorkingBufferSize,
-                    tp);
+                    thread_pool);
 
-    auto working_data = WorkingBufferSize > 0 ? alloc->Alloc(sizeof(float) * WorkingBufferSize) : nullptr;
+    auto* working_data = WorkingBufferSize > 0 ? alloc->Alloc(SafeInt<size_t>(sizeof(float)) * WorkingBufferSize)
+                                               : nullptr;
     BufferUniquePtr working_buffer(working_data, BufferDeleter(alloc));
 
     MlasConv(&Parameters,
@@ -219,18 +236,18 @@ Status Conv<float>::Compute(OpKernelContext* context) const {
              Bdata,
              static_cast<float*>(working_buffer.get()),
              Ydata,
-             tp);
+             thread_pool);
   } else {
     const int64_t input_image_size = input_shape.Size();
     const int64_t output_image_size = output_shape.Size();
     const int64_t kernel_size = TensorShape(kernel_shape).Size();
-    const int64_t X_offset = C / group_ * input_image_size;
-    const int64_t Y_offset = Y->Shape().Size() / Y->Shape()[0] / group_;
-    const int64_t W_offset = W->Shape().Size() / group_;
-    const int64_t kernel_dim = C / group_ * kernel_size;
+    const int64_t X_offset = C / conv_attrs_.group * input_image_size;
+    const int64_t Y_offset = Y->Shape().Size() / Y->Shape()[0] / conv_attrs_.group;
+    const int64_t W_offset = W->Shape().Size() / conv_attrs_.group;
+    const int64_t kernel_dim = C / conv_attrs_.group * kernel_size;
     const int64_t col_buffer_size = kernel_dim * output_image_size;
 
-    auto col_data = alloc->Alloc(sizeof(float) * col_buffer_size);
+    auto* col_data = alloc->Alloc(SafeInt<size_t>(sizeof(float)) * col_buffer_size);
     BufferUniquePtr col_buffer(col_data, BufferDeleter(alloc));
     auto* col_buffer_data = static_cast<float*>(col_buffer.get());
 
@@ -240,8 +257,8 @@ Status Conv<float>::Compute(OpKernelContext* context) const {
                             output_shape.GetDims().end());
 
     for (int image_id = 0; image_id < N; ++image_id) {
-      for (int group_id = 0; group_id < group_; ++group_id) {
-        math::Im2colNd<float, CPUMathUtil, StorageOrder::NCHW>()(
+      for (int group_id = 0; group_id < conv_attrs_.group; ++group_id) {
+        math::Im2colNd<float, StorageOrder::NCHW>()(
             Xdata + group_id * X_offset,
             image_shape.GetDims().data(),
             col_buffer_shape.data(),
@@ -252,12 +269,12 @@ Status Conv<float>::Compute(OpKernelContext* context) const {
             dilations.data(),
             pads.data(),
             static_cast<int>(kernel_shape.size()),
-            col_buffer_data,
-            &CPUMathUtil::Instance());
+            col_buffer_data);
+
         math::Gemm<float>(
             CblasNoTrans,
             CblasNoTrans,
-            M / group_,
+            M / conv_attrs_.group,
             output_image_size,
             kernel_dim,
             1,
@@ -265,22 +282,28 @@ Status Conv<float>::Compute(OpKernelContext* context) const {
             col_buffer_data,
             0,
             Ydata + group_id * Y_offset,
-            tp);
+            thread_pool);
       }
 
       MlasActivation(&activation_, Ydata, Bdata, M, output_image_size, output_image_size);
 
-      Xdata += X_offset * group_;
-      Ydata += Y_offset * group_;
+      Xdata += X_offset * conv_attrs_.group;
+      Ydata += Y_offset * conv_attrs_.group;
     }
   }
 
   return Status::OK();
 }
 
+ONNX_CPU_OPERATOR_VERSIONED_KERNEL(
+    Conv,
+    1, 10,
+    KernelDefBuilder().TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
+    Conv<float>);
+
 ONNX_CPU_OPERATOR_KERNEL(
     Conv,
-    1,
+    11,
     KernelDefBuilder().TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
     Conv<float>);
 

@@ -1,45 +1,62 @@
-variables:
-  DisableContribOps: ON
-  TestDataUrlNoContribOps : https://onnxruntimetestdata.blob.core.windows.net/models/20181210.zip
-
 jobs:
-- job: Linux_CI_Dev
+- job: Linux_Build
+  timeoutInMinutes: 120
+  workspace:
+    clean: all
   pool: Linux-CPU
   steps:
-    - template: templates/set-test-data-variables-step.yml
+  - checkout: self
+    clean: true
+    submodules: recursive
 
-    - task: CmdLine@2
-      displayName: 'Clean untagged docker images'
-      inputs:
-        script: |
-          docker rm $(docker ps -a | grep Exited | awk '{print $1;}') || true
-          docker container prune -f
-          docker image prune -f
-        workingDirectory: $(Build.BinariesDirectory)
-      continueOnError: true
-      condition: always()
+  - task: Docker@2
+    displayName: login
+    inputs:
+      containerRegistry: onnxruntimeregistry
+      command: login
+      addPipelineData: false
+  - task: CmdLine@2
+    inputs:
+      script: |
+        mkdir -p $HOME/.onnx
+        docker run --rm \
+          --volume /data/onnx:/data/onnx:ro \
+          --volume $(Build.SourcesDirectory):/onnxruntime_src \
+          --volume $(Build.BinariesDirectory):/build \
+          --volume /data/models:/build/models:ro \
+          --volume $HOME/.onnx:/home/onnxruntimedev/.onnx \
+          -e ALLOW_RELEASED_ONNX_OPSET_ONLY=0 \
+          -e NIGHTLY_BUILD \
+          -e BUILD_BUILDNUMBER \
+          onnxruntimeregistry.azurecr.io/internal/azureml/onnxruntimecentoscpubuild:ch5g \
+            python3 /onnxruntime_src/tools/ci_build/build.py \
+              --build_dir /build --cmake_generator Ninja \
+              --config Debug Release \
+              --skip_submodule_sync \
+              --build_shared_lib \
+              --parallel \
+              --build_wheel \
+              --enable_onnx_tests \
+              --disable_contrib_ops  --disable_ml_ops
+      workingDirectory: $(Build.SourcesDirectory)
+  - task: Docker@2
+    displayName: logout
+    inputs:
+      containerRegistry: onnxruntimeregistry
+      command: logout
+      addPipelineData: false
+  - task: PublishTestResults@2
+    displayName: 'Publish unit test results'
+    inputs:
+      testResultsFiles: '**/*.results.xml'
+      searchFolder: '$(Build.BinariesDirectory)'
+      testRunTitle: 'Unit Test Run'
+    condition: succeededOrFailed()
 
-    - task: CmdLine@2
-      displayName: 'Download azcopy'
-      inputs:
-        script: |
-          curl -so azcopy.tar.gz -L 'https://aka.ms/downloadazcopy-v10-linux'
-          tar -zxvf azcopy.tar.gz --strip 1
-        workingDirectory: $(Build.BinariesDirectory)
+  - template: templates/component-governance-component-detection-steps.yml
+    parameters:
+      condition: 'succeeded'
 
-    - task: PythonScript@0
-      displayName: 'Download test data'
-      inputs:
-        scriptPath: '$(Build.SourcesDirectory)/tools/ci_build/github/download_test_data.py'
-        arguments: --test_data_url $(TestDataUrlNoContribOps) --build_dir $(Build.BinariesDirectory)
-        pythonInterpreter: '/usr/bin/python3'
-        workingDirectory: $(Build.BinariesDirectory)
-
-    - script: 'tools/ci_build/github/linux/run_dockerbuild.sh -o ubuntu16.04 -d cpu -r $(Build.BinariesDirectory) -x "--disable_contrib_ops"'
-      displayName: 'Command Line Script'
-
-    - task: ms.vss-governance-buildtask.governance-build-task-component-detection.ComponentGovernanceComponentDetection@0
-      displayName: 'Component Detection'
-      condition: and(succeeded(), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI'))
-
-    - template: templates/clean-agent-build-directory-step.yml
+  - task: mspremier.PostBuildCleanup.PostBuildCleanup-task.PostBuildCleanup@3
+    displayName: 'Clean Agent Directories'
+    condition: always()
